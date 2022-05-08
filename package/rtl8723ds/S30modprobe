@@ -1,0 +1,29 @@
+#!/bin/sh
+#
+# load modules
+#
+
+# Debian ifupdown needs the /run/network lock directory
+
+case "$1" in
+  start)
+	printf "Modprobe: "
+	if [ -e /etc/modules ]
+	then
+		cat /etc/modules | xargs modprobe
+	fi
+	[ $? = 0 ] && echo "OK" || echo "FAIL"
+	;;
+  stop)
+	;;
+  restart|reload)
+	"$0" stop
+	"$0" start
+	;;
+  *)
+	echo "Usage: $0 {start|stop|restart}"
+	exit 1
+esac
+
+exit $?
+
