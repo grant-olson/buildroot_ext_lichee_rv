@@ -12,7 +12,7 @@ RTL8723DS_MODULE_MAKE_OPTS = \
 	KSRC=$(LINUX_DIR)
 
 define RTL8723DS_INSTALL_INIT_SYSV
-	$(INSTALL) -m 755 -D package/rtl8723ds/S30modprobe $(TARGET_DIR)/etc/init.d/S30modprobe
+	$(INSTALL) -m 755 -D $(BR2_EXTERNAL_LICHEERV_PATH)/package/rtl8723ds/S30modprobe $(TARGET_DIR)/etc/init.d/S30modprobe
 	echo 8723ds >> $(TARGET_DIR)/etc/modules
 endef
 
