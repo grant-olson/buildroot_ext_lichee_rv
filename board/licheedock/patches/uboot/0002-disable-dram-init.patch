@@ -1,0 +1,24 @@
+diff --git a/arch/riscv/cpu/generic/dram.c b/arch/riscv/cpu/generic/dram.c
+index 1fdc7837b8..8dc14919ce 100644
+--- a/arch/riscv/cpu/generic/dram.c
++++ b/arch/riscv/cpu/generic/dram.c
+@@ -13,12 +13,17 @@ DECLARE_GLOBAL_DATA_PTR;
+ 
+ int dram_init(void)
+ {
+-	return fdtdec_setup_mem_size_base();
++	gd->ram_size = 512 * 1024 * 1024;
++	return 0;
+ }
+ 
++/* This is called after dram_init() so use get_ram_size result */
+ int dram_init_banksize(void)
+ {
+-	return fdtdec_setup_memory_banksize();
++	gd->bd->bi_dram[0].start = CONFIG_SYS_SDRAM_BASE;
++	gd->bd->bi_dram[0].size = gd->ram_size;
++
++	return 0;
+ }
+ 
+ ulong board_get_usable_ram_top(ulong total_size)
