@@ -13,24 +13,58 @@ to allow you to easily build new systems.
       |- buildroot_ext_lichee_rv
     ````
 
-2. Enter the **buildroot** directory, enable the external package, and
+2. Patch buildroot until I get the updates to the bootloader accepted upstream
+    or figure out how to patch it via the extensions:
+
+    ```
+    grant@NUC:~/src$ cd buildroot
+    grant@NUC:~/src/buildroot$ patch -d . -p1 < ../buildroot_ext_lichee_rv/0001-fix-sun20i-d1-spl-in-buildroot.patch 
+    patching file boot/sun20i-d1-spl/sun20i-d1-spl.hash
+    patching file boot/sun20i-d1-spl/sun20i-d1-spl.mk
+    grant@NUC:~/src/buildroot$ git diff
+    diff --git a/boot/sun20i-d1-spl/sun20i-d1-spl.hash b/boot/sun20i-d1-spl/sun20i-d1-spl.hash
+    deleted file mode 100644
+    index 6ca60e5278..0000000000
+    --- a/boot/sun20i-d1-spl/sun20i-d1-spl.hash
+    +++ /dev/null
+    @@ -1,2 +0,0 @@
+    -# Locally computed
+    -sha256  69063601239a7254fb72e486b138d88a6f2b5c645b24cdfe9792123f975d4a8f  sun20i-d1-spl-771192d0b3737798d7feca87263c8fa74a449787.tar.gz
+    diff --git a/boot/sun20i-d1-spl/sun20i-d1-spl.mk b/boot/sun20i-d1-spl/sun20i-d1-spl.mk
+    index 2462ce2322..1f1cd99b2d 100644
+    --- a/boot/sun20i-d1-spl/sun20i-d1-spl.mk
+    +++ b/boot/sun20i-d1-spl/sun20i-d1-spl.mk
+    @@ -5,7 +5,7 @@
+     ################################################################################
+     
+     # Commit on the 'mainline' branch
+    -SUN20I_D1_SPL_VERSION = 771192d0b3737798d7feca87263c8fa74a449787
+    +SUN20I_D1_SPL_VERSION = 525883d3721f4c4d78b498e780b44e85d0676abf
+     SUN20I_D1_SPL_SITE = $(call github,smaeul,sun20i_d1_spl,$(SUN20I_D1_SPL_VERSION))
+     SUN20I_D1_SPL_INSTALL_TARGET = NO
+     SUN20I_D1_SPL_INSTALL_IMAGES = YES
+    grant@NUC:~/src/buildroot$ 
+
+    ```
+    
+3. Enter the **buildroot** directory, enable the external package, and
     grab a lichee rv configuration.
 
     ```
     grant@NUC:~/src/buildroot2$ make BR2_EXTERNAL=~/src/buildroot_ext_lichee_rv licheedock_defconfig
     ```
 
-3. You will probably want to do some minimal configuration. For
+4. You will probably want to do some minimal configuration. For
     example adding **dropbear** for ssh access and **nano** so you don't
     need to use `vi` to edit files.
 
     ```make menuconfig```
 
-4. Build the system.
+5. Build the system.
 
     ```make```
 
-5. Grab the image in `output/images/sdcard.img` and deploy it.
+6. Grab the image in `output/images/sdcard.img` and deploy it.
 
 ## Disabling external package
 
