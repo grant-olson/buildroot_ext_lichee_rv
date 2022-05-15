@@ -1,7 +1,10 @@
 # Buildroot Externals for Lichee RV Dock
 
 This adds support for the RISC-V based Lichee RV products to buildroot
-to allow you to easily build new systems.
+to allow you to easily build new systems. Buildroot has support for
+the main Nezha board, but it does not have built in support for the
+additional hardware on these boards. This package attempts to add
+support for all hardware.
 
 ## Building an image
 
@@ -50,8 +53,16 @@ to allow you to easily build new systems.
 3. Enter the **buildroot** directory, enable the external package, and
     grab a lichee rv configuration.
 
+    For RV DOCK:
+
     ```
     grant@NUC:~/src/buildroot2$ make BR2_EXTERNAL=~/src/buildroot_ext_lichee_rv licheedock_defconfig
+    ```
+
+    For RV PANEL:
+
+    ```
+    grant@NUC:~/src/buildroot2$ make BR2_EXTERNAL=~/src/buildroot_ext_lichee_rv lichee86panel_defconfig
     ```
 
 4. You will probably want to do some minimal configuration. For
