@@ -10,9 +10,9 @@ integrate in Buildroot as-is.
 Signed-off-by: Peter Korsgaard <peter@korsgaard.com>
 ---
  Makefile  | 9 +++++++++
- nezha.cfg | 9 +++++++++
+ licheedock.cfg | 9 +++++++++
  2 files changed, 18 insertions(+)
- create mode 100644 nezha.cfg
+ create mode 100644 licheedock.cfg
 
 diff --git a/Makefile b/Makefile
 index f911f70344..259d93bf80 100644
@@ -26,7 +26,7 @@ index f911f70344..259d93bf80 100644
 +	$(call if_changed,copy)
 +
 +MKIMAGEFLAGS_u-boot.toc1 = -T sunxi_toc1
-+u-boot.toc1: nezha.cfg fw_dynamic.bin inputs
++u-boot.toc1: licheedock.cfg fw_dynamic.bin inputs
 +	$(call if_changed,mkimage)
 +
 +all: u-boot.toc1
@@ -34,17 +34,17 @@ index f911f70344..259d93bf80 100644
  ifeq ($(CONFIG_DEPRECATED),y)
  	$(warning "You have deprecated configuration options enabled in your .config! Please check your configuration.")
  endif
-diff --git a/nezha.cfg b/nezha.cfg
+diff --git a/licheedock.cfg b/licheedock.cfg
 new file mode 100644
 index 0000000000..2d23b9b388
 --- /dev/null
-+++ b/nezha.cfg
++++ b/licheedock.cfg
 @@ -0,0 +1,9 @@
 +[opensbi]
 +file = fw_dynamic.bin
 +addr = 0x40000000
 +[dtb]
-+file = arch/riscv/dts/sun20i-d1-nezha.dtb
++file = arch/riscv/dts/sun20i-d1-lichee-rv-dock.dtb
 +addr = 0x44000000
 +[u-boot]
 +file = u-boot-nodtb.bin
