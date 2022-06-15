@@ -1,0 +1,5475 @@
+From b367b9fd3fc098aaef3bfa4735b245d77c192845 Mon Sep 17 00:00:00 2001
+From: "Grant T. Olson" <kgo@grant-olson.net>
+Date: Tue, 14 Jun 2022 21:26:49 -0400
+Subject: [PATCH] Fixes for missing files on cuu repo
+
+---
+ .gitignore                                  |    1 -
+ drivers/base/test/Kconfig                   |   10 +
+ drivers/base/test/Makefile                  |    2 +
+ drivers/base/test/test_async_driver_probe.c |  303 ++++
+ drivers/firmware/efi/test/Makefile          |    2 +
+ drivers/firmware/efi/test/efi_test.c        |  778 +++++++++
+ drivers/firmware/efi/test/efi_test.h        |  121 ++
+ drivers/ntb/test/Kconfig                    |   37 +
+ drivers/ntb/test/Makefile                   |    5 +
+ drivers/ntb/test/ntb_msi_test.c             |  433 +++++
+ drivers/ntb/test/ntb_perf.c                 | 1536 +++++++++++++++++
+ drivers/ntb/test/ntb_pingpong.c             |  436 +++++
+ drivers/ntb/test/ntb_tool.c                 | 1692 +++++++++++++++++++
+ 13 files changed, 5355 insertions(+), 1 deletion(-)
+ create mode 100644 drivers/base/test/Kconfig
+ create mode 100644 drivers/base/test/Makefile
+ create mode 100644 drivers/base/test/test_async_driver_probe.c
+ create mode 100644 drivers/firmware/efi/test/Makefile
+ create mode 100644 drivers/firmware/efi/test/efi_test.c
+ create mode 100644 drivers/firmware/efi/test/efi_test.h
+ create mode 100644 drivers/ntb/test/Kconfig
+ create mode 100644 drivers/ntb/test/Makefile
+ create mode 100644 drivers/ntb/test/ntb_msi_test.c
+ create mode 100644 drivers/ntb/test/ntb_perf.c
+ create mode 100644 drivers/ntb/test/ntb_pingpong.c
+ create mode 100644 drivers/ntb/test/ntb_tool.c
+
+diff --git a/.gitignore b/.gitignore
+index 3a1f67d11..885cfb5b6 100644
+--- a/.gitignore
++++ b/.gitignore
+@@ -156,7 +156,6 @@ output/
+ arch/arm64/boot/dts/sunxi/board.dts
+ arch/arm/boot/dts/board.dts
+ #arch/riscv/boot/dts/sunxi/board.dts
+-test/
+ test_guu/
+ 
+ #lto lds
+diff --git a/drivers/base/test/Kconfig b/drivers/base/test/Kconfig
+new file mode 100644
+index 000000000..86e85daa8
+--- /dev/null
++++ b/drivers/base/test/Kconfig
+@@ -0,0 +1,10 @@
++# SPDX-License-Identifier: GPL-2.0
++config TEST_ASYNC_DRIVER_PROBE
++	tristate "Build kernel module to test asynchronous driver probing"
++	depends on m
++	help
++	  Enabling this option produces a kernel module that allows
++	  testing asynchronous driver probing by the device core.
++	  The module name will be test_async_driver_probe.ko
++
++	  If unsure say N.
+diff --git a/drivers/base/test/Makefile b/drivers/base/test/Makefile
+new file mode 100644
+index 000000000..0f1f7277a
+--- /dev/null
++++ b/drivers/base/test/Makefile
+@@ -0,0 +1,2 @@
++# SPDX-License-Identifier: GPL-2.0
++obj-$(CONFIG_TEST_ASYNC_DRIVER_PROBE)	+= test_async_driver_probe.o
+diff --git a/drivers/base/test/test_async_driver_probe.c b/drivers/base/test/test_async_driver_probe.c
+new file mode 100644
+index 000000000..3bb7beb12
+--- /dev/null
++++ b/drivers/base/test/test_async_driver_probe.c
+@@ -0,0 +1,303 @@
++// SPDX-License-Identifier: GPL-2.0
++/*
++ * Copyright (C) 2014 Google, Inc.
++ */
++
++#define pr_fmt(fmt) KBUILD_MODNAME ": " fmt
++
++#include <linux/delay.h>
++#include <linux/init.h>
++#include <linux/hrtimer.h>
++#include <linux/module.h>
++#include <linux/platform_device.h>
++#include <linux/time.h>
++#include <linux/numa.h>
++#include <linux/nodemask.h>
++#include <linux/topology.h>
++
++#define TEST_PROBE_DELAY	(5 * 1000)	/* 5 sec */
++#define TEST_PROBE_THRESHOLD	(TEST_PROBE_DELAY / 2)
++
++static atomic_t warnings, errors, timeout, async_completed;
++
++static int test_probe(struct platform_device *pdev)
++{
++	struct device *dev = &pdev->dev;
++
++	/*
++	 * Determine if we have hit the "timeout" limit for the test if we
++	 * have then report it as an error, otherwise we wil sleep for the
++	 * required amount of time and then report completion.
++	 */
++	if (atomic_read(&timeout)) {
++		dev_err(dev, "async probe took too long\n");
++		atomic_inc(&errors);
++	} else {
++		dev_dbg(&pdev->dev, "sleeping for %d msecs in probe\n",
++			 TEST_PROBE_DELAY);
++		msleep(TEST_PROBE_DELAY);
++		dev_dbg(&pdev->dev, "done sleeping\n");
++	}
++
++	/*
++	 * Report NUMA mismatch if device node is set and we are not
++	 * performing an async init on that node.
++	 */
++	if (dev->driver->probe_type == PROBE_PREFER_ASYNCHRONOUS) {
++		if (IS_ENABLED(CONFIG_NUMA) &&
++		    dev_to_node(dev) != numa_node_id()) {
++			dev_warn(dev, "NUMA node mismatch %d != %d\n",
++				 dev_to_node(dev), numa_node_id());
++			atomic_inc(&warnings);
++		}
++
++		atomic_inc(&async_completed);
++	}
++
++	return 0;
++}
++
++static struct platform_driver async_driver = {
++	.driver = {
++		.name = "test_async_driver",
++		.probe_type = PROBE_PREFER_ASYNCHRONOUS,
++	},
++	.probe = test_probe,
++};
++
++static struct platform_driver sync_driver = {
++	.driver = {
++		.name = "test_sync_driver",
++		.probe_type = PROBE_FORCE_SYNCHRONOUS,
++	},
++	.probe = test_probe,
++};
++
++static struct platform_device *async_dev[NR_CPUS * 2];
++static struct platform_device *sync_dev[2];
++
++static struct platform_device *
++test_platform_device_register_node(char *name, int id, int nid)
++{
++	struct platform_device *pdev;
++	int ret;
++
++	pdev = platform_device_alloc(name, id);
++	if (!pdev)
++		return NULL;
++
++	if (nid != NUMA_NO_NODE)
++		set_dev_node(&pdev->dev, nid);
++
++	ret = platform_device_add(pdev);
++	if (ret) {
++		platform_device_put(pdev);
++		return ERR_PTR(ret);
++	}
++
++	return pdev;
++
++}
++
++static int __init test_async_probe_init(void)
++{
++	struct platform_device **pdev = NULL;
++	int async_id = 0, sync_id = 0;
++	unsigned long long duration;
++	ktime_t calltime, delta;
++	int err, nid, cpu;
++
++	pr_info("registering first set of asynchronous devices...\n");
++
++	for_each_online_cpu(cpu) {
++		nid = cpu_to_node(cpu);
++		pdev = &async_dev[async_id];
++		*pdev =	test_platform_device_register_node("test_async_driver",
++							   async_id,
++							   nid);
++		if (IS_ERR(*pdev)) {
++			err = PTR_ERR(*pdev);
++			*pdev = NULL;
++			pr_err("failed to create async_dev: %d\n", err);
++			goto err_unregister_async_devs;
++		}
++
++		async_id++;
++	}
++
++	pr_info("registering asynchronous driver...\n");
++	calltime = ktime_get();
++	err = platform_driver_register(&async_driver);
++	if (err) {
++		pr_err("Failed to register async_driver: %d\n", err);
++		goto err_unregister_async_devs;
++	}
++
++	delta = ktime_sub(ktime_get(), calltime);
++	duration = (unsigned long long) ktime_to_ms(delta);
++	pr_info("registration took %lld msecs\n", duration);
++	if (duration > TEST_PROBE_THRESHOLD) {
++		pr_err("test failed: probe took too long\n");
++		err = -ETIMEDOUT;
++		goto err_unregister_async_driver;
++	}
++
++	pr_info("registering second set of asynchronous devices...\n");
++	calltime = ktime_get();
++	for_each_online_cpu(cpu) {
++		nid = cpu_to_node(cpu);
++		pdev = &sync_dev[sync_id];
++
++		*pdev = test_platform_device_register_node("test_async_driver",
++							   async_id,
++							   nid);
++		if (IS_ERR(*pdev)) {
++			err = PTR_ERR(*pdev);
++			*pdev = NULL;
++			pr_err("failed to create async_dev: %d\n", err);
++			goto err_unregister_async_driver;
++		}
++
++		async_id++;
++	}
++
++	delta = ktime_sub(ktime_get(), calltime);
++	duration = (unsigned long long) ktime_to_ms(delta);
++	dev_info(&(*pdev)->dev,
++		 "registration took %lld msecs\n", duration);
++	if (duration > TEST_PROBE_THRESHOLD) {
++		dev_err(&(*pdev)->dev,
++			"test failed: probe took too long\n");
++		err = -ETIMEDOUT;
++		goto err_unregister_async_driver;
++	}
++
++
++	pr_info("registering first synchronous device...\n");
++	nid = cpu_to_node(cpu);
++	pdev = &sync_dev[sync_id];
++
++	*pdev = test_platform_device_register_node("test_sync_driver",
++						   sync_id,
++						   NUMA_NO_NODE);
++	if (IS_ERR(*pdev)) {
++		err = PTR_ERR(*pdev);
++		*pdev = NULL;
++		pr_err("failed to create sync_dev: %d\n", err);
++		goto err_unregister_async_driver;
++	}
++
++	sync_id++;
++
++	pr_info("registering synchronous driver...\n");
++	calltime = ktime_get();
++	err = platform_driver_register(&sync_driver);
++	if (err) {
++		pr_err("Failed to register async_driver: %d\n", err);
++		goto err_unregister_sync_devs;
++	}
++
++	delta = ktime_sub(ktime_get(), calltime);
++	duration = (unsigned long long) ktime_to_ms(delta);
++	pr_info("registration took %lld msecs\n", duration);
++	if (duration < TEST_PROBE_THRESHOLD) {
++		dev_err(&(*pdev)->dev,
++			"test failed: probe was too quick\n");
++		err = -ETIMEDOUT;
++		goto err_unregister_sync_driver;
++	}
++
++	pr_info("registering second synchronous device...\n");
++	pdev = &sync_dev[sync_id];
++	calltime = ktime_get();
++
++	*pdev = test_platform_device_register_node("test_sync_driver",
++						   sync_id,
++						   NUMA_NO_NODE);
++	if (IS_ERR(*pdev)) {
++		err = PTR_ERR(*pdev);
++		*pdev = NULL;
++		pr_err("failed to create sync_dev: %d\n", err);
++		goto err_unregister_sync_driver;
++	}
++
++	sync_id++;
++
++	delta = ktime_sub(ktime_get(), calltime);
++	duration = (unsigned long long) ktime_to_ms(delta);
++	dev_info(&(*pdev)->dev,
++		 "registration took %lld msecs\n", duration);
++	if (duration < TEST_PROBE_THRESHOLD) {
++		dev_err(&(*pdev)->dev,
++			"test failed: probe was too quick\n");
++		err = -ETIMEDOUT;
++		goto err_unregister_sync_driver;
++	}
++
++	/*
++	 * The async events should have completed while we were taking care
++	 * of the synchronous events. We will now terminate any outstanding
++	 * asynchronous probe calls remaining by forcing timeout and remove
++	 * the driver before we return which should force the flush of the
++	 * pending asynchronous probe calls.
++	 *
++	 * Otherwise if they completed without errors or warnings then
++	 * report successful completion.
++	 */
++	if (atomic_read(&async_completed) != async_id) {
++		pr_err("async events still pending, forcing timeout\n");
++		atomic_inc(&timeout);
++		err = -ETIMEDOUT;
++	} else if (!atomic_read(&errors) && !atomic_read(&warnings)) {
++		pr_info("completed successfully\n");
++		return 0;
++	}
++
++err_unregister_sync_driver:
++	platform_driver_unregister(&sync_driver);
++err_unregister_sync_devs:
++	while (sync_id--)
++		platform_device_unregister(sync_dev[sync_id]);
++err_unregister_async_driver:
++	platform_driver_unregister(&async_driver);
++err_unregister_async_devs:
++	while (async_id--)
++		platform_device_unregister(async_dev[async_id]);
++
++	/*
++	 * If err is already set then count that as an additional error for
++	 * the test. Otherwise we will report an invalid argument error and
++	 * not count that as we should have reached here as a result of
++	 * errors or warnings being reported by the probe routine.
++	 */
++	if (err)
++		atomic_inc(&errors);
++	else
++		err = -EINVAL;
++
++	pr_err("Test failed with %d errors and %d warnings\n",
++	       atomic_read(&errors), atomic_read(&warnings));
++
++	return err;
++}
++module_init(test_async_probe_init);
++
++static void __exit test_async_probe_exit(void)
++{
++	int id = 2;
++
++	platform_driver_unregister(&async_driver);
++	platform_driver_unregister(&sync_driver);
++
++	while (id--)
++		platform_device_unregister(sync_dev[id]);
++
++	id = NR_CPUS * 2;
++	while (id--)
++		platform_device_unregister(async_dev[id]);
++}
++module_exit(test_async_probe_exit);
++
++MODULE_DESCRIPTION("Test module for asynchronous driver probing");
++MODULE_AUTHOR("Dmitry Torokhov <dtor@chromium.org>");
++MODULE_LICENSE("GPL");
+diff --git a/drivers/firmware/efi/test/Makefile b/drivers/firmware/efi/test/Makefile
+new file mode 100644
+index 000000000..419708855
+--- /dev/null
++++ b/drivers/firmware/efi/test/Makefile
+@@ -0,0 +1,2 @@
++# SPDX-License-Identifier: GPL-2.0-only
++obj-$(CONFIG_EFI_TEST)			+= efi_test.o
+diff --git a/drivers/firmware/efi/test/efi_test.c b/drivers/firmware/efi/test/efi_test.c
+new file mode 100644
+index 000000000..7baf48c01
+--- /dev/null
++++ b/drivers/firmware/efi/test/efi_test.c
+@@ -0,0 +1,778 @@
++// SPDX-License-Identifier: GPL-2.0+
++/*
++ * EFI Test Driver for Runtime Services
++ *
++ * Copyright(C) 2012-2016 Canonical Ltd.
++ *
++ * This driver exports EFI runtime services interfaces into userspace, which
++ * allow to use and test UEFI runtime services provided by firmware.
++ *
++ */
++
++#include <linux/miscdevice.h>
++#include <linux/module.h>
++#include <linux/init.h>
++#include <linux/proc_fs.h>
++#include <linux/efi.h>
++#include <linux/security.h>
++#include <linux/slab.h>
++#include <linux/uaccess.h>
++
++#include "efi_test.h"
++
++MODULE_AUTHOR("Ivan Hu <ivan.hu@canonical.com>");
++MODULE_DESCRIPTION("EFI Test Driver");
++MODULE_LICENSE("GPL");
++
++/*
++ * Count the bytes in 'str', including the terminating NULL.
++ *
++ * Note this function returns the number of *bytes*, not the number of
++ * ucs2 characters.
++ */
++static inline size_t user_ucs2_strsize(efi_char16_t  __user *str)
++{
++	efi_char16_t *s = str, c;
++	size_t len;
++
++	if (!str)
++		return 0;
++
++	/* Include terminating NULL */
++	len = sizeof(efi_char16_t);
++
++	if (get_user(c, s++)) {
++		/* Can't read userspace memory for size */
++		return 0;
++	}
++
++	while (c != 0) {
++		if (get_user(c, s++)) {
++			/* Can't read userspace memory for size */
++			return 0;
++		}
++		len += sizeof(efi_char16_t);
++	}
++	return len;
++}
++
++/*
++ * Allocate a buffer and copy a ucs2 string from user space into it.
++ */
++static inline int
++copy_ucs2_from_user_len(efi_char16_t **dst, efi_char16_t __user *src,
++			size_t len)
++{
++	efi_char16_t *buf;
++
++	if (!src) {
++		*dst = NULL;
++		return 0;
++	}
++
++	if (!access_ok(src, 1))
++		return -EFAULT;
++
++	buf = memdup_user(src, len);
++	if (IS_ERR(buf)) {
++		*dst = NULL;
++		return PTR_ERR(buf);
++	}
++	*dst = buf;
++
++	return 0;
++}
++
++/*
++ * Count the bytes in 'str', including the terminating NULL.
++ *
++ * Just a wrap for user_ucs2_strsize
++ */
++static inline int
++get_ucs2_strsize_from_user(efi_char16_t __user *src, size_t *len)
++{
++	if (!access_ok(src, 1))
++		return -EFAULT;
++
++	*len = user_ucs2_strsize(src);
++	if (*len == 0)
++		return -EFAULT;
++
++	return 0;
++}
++
++/*
++ * Calculate the required buffer allocation size and copy a ucs2 string
++ * from user space into it.
++ *
++ * This function differs from copy_ucs2_from_user_len() because it
++ * calculates the size of the buffer to allocate by taking the length of
++ * the string 'src'.
++ *
++ * If a non-zero value is returned, the caller MUST NOT access 'dst'.
++ *
++ * It is the caller's responsibility to free 'dst'.
++ */
++static inline int
++copy_ucs2_from_user(efi_char16_t **dst, efi_char16_t __user *src)
++{
++	size_t len;
++
++	if (!access_ok(src, 1))
++		return -EFAULT;
++
++	len = user_ucs2_strsize(src);
++	if (len == 0)
++		return -EFAULT;
++	return copy_ucs2_from_user_len(dst, src, len);
++}
++
++/*
++ * Copy a ucs2 string to a user buffer.
++ *
++ * This function is a simple wrapper around copy_to_user() that does
++ * nothing if 'src' is NULL, which is useful for reducing the amount of
++ * NULL checking the caller has to do.
++ *
++ * 'len' specifies the number of bytes to copy.
++ */
++static inline int
++copy_ucs2_to_user_len(efi_char16_t __user *dst, efi_char16_t *src, size_t len)
++{
++	if (!src)
++		return 0;
++
++	if (!access_ok(dst, 1))
++		return -EFAULT;
++
++	return copy_to_user(dst, src, len);
++}
++
++static long efi_runtime_get_variable(unsigned long arg)
++{
++	struct efi_getvariable __user *getvariable_user;
++	struct efi_getvariable getvariable;
++	unsigned long datasize = 0, prev_datasize, *dz;
++	efi_guid_t vendor_guid, *vd = NULL;
++	efi_status_t status;
++	efi_char16_t *name = NULL;
++	u32 attr, *at;
++	void *data = NULL;
++	int rv = 0;
++
++	getvariable_user = (struct efi_getvariable __user *)arg;
++
++	if (copy_from_user(&getvariable, getvariable_user,
++			   sizeof(getvariable)))
++		return -EFAULT;
++	if (getvariable.data_size &&
++	    get_user(datasize, getvariable.data_size))
++		return -EFAULT;
++	if (getvariable.vendor_guid) {
++		if (copy_from_user(&vendor_guid, getvariable.vendor_guid,
++					sizeof(vendor_guid)))
++			return -EFAULT;
++		vd = &vendor_guid;
++	}
++
++	if (getvariable.variable_name) {
++		rv = copy_ucs2_from_user(&name, getvariable.variable_name);
++		if (rv)
++			return rv;
++	}
++
++	at = getvariable.attributes ? &attr : NULL;
++	dz = getvariable.data_size ? &datasize : NULL;
++
++	if (getvariable.data_size && getvariable.data) {
++		data = kmalloc(datasize, GFP_KERNEL);
++		if (!data) {
++			kfree(name);
++			return -ENOMEM;
++		}
++	}
++
++	prev_datasize = datasize;
++	status = efi.get_variable(name, vd, at, dz, data);
++	kfree(name);
++
++	if (put_user(status, getvariable.status)) {
++		rv = -EFAULT;
++		goto out;
++	}
++
++	if (status != EFI_SUCCESS) {
++		if (status == EFI_BUFFER_TOO_SMALL) {
++			if (dz && put_user(datasize, getvariable.data_size)) {
++				rv = -EFAULT;
++				goto out;
++			}
++		}
++		rv = -EINVAL;
++		goto out;
++	}
++
++	if (prev_datasize < datasize) {
++		rv = -EINVAL;
++		goto out;
++	}
++
++	if (data) {
++		if (copy_to_user(getvariable.data, data, datasize)) {
++			rv = -EFAULT;
++			goto out;
++		}
++	}
++
++	if (at && put_user(attr, getvariable.attributes)) {
++		rv = -EFAULT;
++		goto out;
++	}
++
++	if (dz && put_user(datasize, getvariable.data_size))
++		rv = -EFAULT;
++
++out:
++	kfree(data);
++	return rv;
++
++}
++
++static long efi_runtime_set_variable(unsigned long arg)
++{
++	struct efi_setvariable __user *setvariable_user;
++	struct efi_setvariable setvariable;
++	efi_guid_t vendor_guid;
++	efi_status_t status;
++	efi_char16_t *name = NULL;
++	void *data;
++	int rv = 0;
++
++	setvariable_user = (struct efi_setvariable __user *)arg;
++
++	if (copy_from_user(&setvariable, setvariable_user, sizeof(setvariable)))
++		return -EFAULT;
++	if (copy_from_user(&vendor_guid, setvariable.vendor_guid,
++				sizeof(vendor_guid)))
++		return -EFAULT;
++
++	if (setvariable.variable_name) {
++		rv = copy_ucs2_from_user(&name, setvariable.variable_name);
++		if (rv)
++			return rv;
++	}
++
++	data = memdup_user(setvariable.data, setvariable.data_size);
++	if (IS_ERR(data)) {
++		kfree(name);
++		return PTR_ERR(data);
++	}
++
++	status = efi.set_variable(name, &vendor_guid,
++				setvariable.attributes,
++				setvariable.data_size, data);
++
++	if (put_user(status, setvariable.status)) {
++		rv = -EFAULT;
++		goto out;
++	}
++
++	rv = status == EFI_SUCCESS ? 0 : -EINVAL;
++
++out:
++	kfree(data);
++	kfree(name);
++
++	return rv;
++}
++
++static long efi_runtime_get_time(unsigned long arg)
++{
++	struct efi_gettime __user *gettime_user;
++	struct efi_gettime  gettime;
++	efi_status_t status;
++	efi_time_cap_t cap;
++	efi_time_t efi_time;
++
++	gettime_user = (struct efi_gettime __user *)arg;
++	if (copy_from_user(&gettime, gettime_user, sizeof(gettime)))
++		return -EFAULT;
++
++	status = efi.get_time(gettime.time ? &efi_time : NULL,
++			      gettime.capabilities ? &cap : NULL);
++
++	if (put_user(status, gettime.status))
++		return -EFAULT;
++
++	if (status != EFI_SUCCESS)
++		return -EINVAL;
++
++	if (gettime.capabilities) {
++		efi_time_cap_t __user *cap_local;
++
++		cap_local = (efi_time_cap_t *)gettime.capabilities;
++		if (put_user(cap.resolution, &(cap_local->resolution)) ||
++			put_user(cap.accuracy, &(cap_local->accuracy)) ||
++			put_user(cap.sets_to_zero, &(cap_local->sets_to_zero)))
++			return -EFAULT;
++	}
++	if (gettime.time) {
++		if (copy_to_user(gettime.time, &efi_time, sizeof(efi_time_t)))
++			return -EFAULT;
++	}
++
++	return 0;
++}
++
++static long efi_runtime_set_time(unsigned long arg)
++{
++	struct efi_settime __user *settime_user;
++	struct efi_settime settime;
++	efi_status_t status;
++	efi_time_t efi_time;
++
++	settime_user = (struct efi_settime __user *)arg;
++	if (copy_from_user(&settime, settime_user, sizeof(settime)))
++		return -EFAULT;
++	if (copy_from_user(&efi_time, settime.time,
++					sizeof(efi_time_t)))
++		return -EFAULT;
++	status = efi.set_time(&efi_time);
++
++	if (put_user(status, settime.status))
++		return -EFAULT;
++
++	return status == EFI_SUCCESS ? 0 : -EINVAL;
++}
++
++static long efi_runtime_get_waketime(unsigned long arg)
++{
++	struct efi_getwakeuptime __user *getwakeuptime_user;
++	struct efi_getwakeuptime getwakeuptime;
++	efi_bool_t enabled, pending;
++	efi_status_t status;
++	efi_time_t efi_time;
++
++	getwakeuptime_user = (struct efi_getwakeuptime __user *)arg;
++	if (copy_from_user(&getwakeuptime, getwakeuptime_user,
++				sizeof(getwakeuptime)))
++		return -EFAULT;
++
++	status = efi.get_wakeup_time(
++		getwakeuptime.enabled ? (efi_bool_t *)&enabled : NULL,
++		getwakeuptime.pending ? (efi_bool_t *)&pending : NULL,
++		getwakeuptime.time ? &efi_time : NULL);
++
++	if (put_user(status, getwakeuptime.status))
++		return -EFAULT;
++
++	if (status != EFI_SUCCESS)
++		return -EINVAL;
++
++	if (getwakeuptime.enabled && put_user(enabled,
++						getwakeuptime.enabled))
++		return -EFAULT;
++
++	if (getwakeuptime.time) {
++		if (copy_to_user(getwakeuptime.time, &efi_time,
++				sizeof(efi_time_t)))
++			return -EFAULT;
++	}
++
++	return 0;
++}
++
++static long efi_runtime_set_waketime(unsigned long arg)
++{
++	struct efi_setwakeuptime __user *setwakeuptime_user;
++	struct efi_setwakeuptime setwakeuptime;
++	efi_bool_t enabled;
++	efi_status_t status;
++	efi_time_t efi_time;
++
++	setwakeuptime_user = (struct efi_setwakeuptime __user *)arg;
++
++	if (copy_from_user(&setwakeuptime, setwakeuptime_user,
++				sizeof(setwakeuptime)))
++		return -EFAULT;
++
++	enabled = setwakeuptime.enabled;
++	if (setwakeuptime.time) {
++		if (copy_from_user(&efi_time, setwakeuptime.time,
++					sizeof(efi_time_t)))
++			return -EFAULT;
++
++		status = efi.set_wakeup_time(enabled, &efi_time);
++	} else
++		status = efi.set_wakeup_time(enabled, NULL);
++
++	if (put_user(status, setwakeuptime.status))
++		return -EFAULT;
++
++	return status == EFI_SUCCESS ? 0 : -EINVAL;
++}
++
++static long efi_runtime_get_nextvariablename(unsigned long arg)
++{
++	struct efi_getnextvariablename __user *getnextvariablename_user;
++	struct efi_getnextvariablename getnextvariablename;
++	unsigned long name_size, prev_name_size = 0, *ns = NULL;
++	efi_status_t status;
++	efi_guid_t *vd = NULL;
++	efi_guid_t vendor_guid;
++	efi_char16_t *name = NULL;
++	int rv = 0;
++
++	getnextvariablename_user = (struct efi_getnextvariablename __user *)arg;
++
++	if (copy_from_user(&getnextvariablename, getnextvariablename_user,
++			   sizeof(getnextvariablename)))
++		return -EFAULT;
++
++	if (getnextvariablename.variable_name_size) {
++		if (get_user(name_size, getnextvariablename.variable_name_size))
++			return -EFAULT;
++		ns = &name_size;
++		prev_name_size = name_size;
++	}
++
++	if (getnextvariablename.vendor_guid) {
++		if (copy_from_user(&vendor_guid,
++				getnextvariablename.vendor_guid,
++				sizeof(vendor_guid)))
++			return -EFAULT;
++		vd = &vendor_guid;
++	}
++
++	if (getnextvariablename.variable_name) {
++		size_t name_string_size = 0;
++
++		rv = get_ucs2_strsize_from_user(
++				getnextvariablename.variable_name,
++				&name_string_size);
++		if (rv)
++			return rv;
++		/*
++		 * The name_size may be smaller than the real buffer size where
++		 * variable name located in some use cases. The most typical
++		 * case is passing a 0 to get the required buffer size for the
++		 * 1st time call. So we need to copy the content from user
++		 * space for at least the string size of variable name, or else
++		 * the name passed to UEFI may not be terminated as we expected.
++		 */
++		rv = copy_ucs2_from_user_len(&name,
++				getnextvariablename.variable_name,
++				prev_name_size > name_string_size ?
++				prev_name_size : name_string_size);
++		if (rv)
++			return rv;
++	}
++
++	status = efi.get_next_variable(ns, name, vd);
++
++	if (put_user(status, getnextvariablename.status)) {
++		rv = -EFAULT;
++		goto out;
++	}
++
++	if (status != EFI_SUCCESS) {
++		if (status == EFI_BUFFER_TOO_SMALL) {
++			if (ns && put_user(*ns,
++				getnextvariablename.variable_name_size)) {
++				rv = -EFAULT;
++				goto out;
++			}
++		}
++		rv = -EINVAL;
++		goto out;
++	}
++
++	if (name) {
++		if (copy_ucs2_to_user_len(getnextvariablename.variable_name,
++						name, prev_name_size)) {
++			rv = -EFAULT;
++			goto out;
++		}
++	}
++
++	if (ns) {
++		if (put_user(*ns, getnextvariablename.variable_name_size)) {
++			rv = -EFAULT;
++			goto out;
++		}
++	}
++
++	if (vd) {
++		if (copy_to_user(getnextvariablename.vendor_guid, vd,
++							sizeof(efi_guid_t)))
++			rv = -EFAULT;
++	}
++
++out:
++	kfree(name);
++	return rv;
++}
++
++static long efi_runtime_get_nexthighmonocount(unsigned long arg)
++{
++	struct efi_getnexthighmonotoniccount __user *getnexthighmonocount_user;
++	struct efi_getnexthighmonotoniccount getnexthighmonocount;
++	efi_status_t status;
++	u32 count;
++
++	getnexthighmonocount_user = (struct
++			efi_getnexthighmonotoniccount __user *)arg;
++
++	if (copy_from_user(&getnexthighmonocount,
++			   getnexthighmonocount_user,
++			   sizeof(getnexthighmonocount)))
++		return -EFAULT;
++
++	status = efi.get_next_high_mono_count(
++		getnexthighmonocount.high_count ? &count : NULL);
++
++	if (put_user(status, getnexthighmonocount.status))
++		return -EFAULT;
++
++	if (status != EFI_SUCCESS)
++		return -EINVAL;
++
++	if (getnexthighmonocount.high_count &&
++	    put_user(count, getnexthighmonocount.high_count))
++		return -EFAULT;
++
++	return 0;
++}
++
++static long efi_runtime_reset_system(unsigned long arg)
++{
++	struct efi_resetsystem __user *resetsystem_user;
++	struct efi_resetsystem resetsystem;
++	void *data = NULL;
++
++	resetsystem_user = (struct efi_resetsystem __user *)arg;
++	if (copy_from_user(&resetsystem, resetsystem_user,
++						sizeof(resetsystem)))
++		return -EFAULT;
++	if (resetsystem.data_size != 0) {
++		data = memdup_user((void *)resetsystem.data,
++						resetsystem.data_size);
++		if (IS_ERR(data))
++			return PTR_ERR(data);
++	}
++
++	efi.reset_system(resetsystem.reset_type, resetsystem.status,
++				resetsystem.data_size, (efi_char16_t *)data);
++
++	kfree(data);
++	return 0;
++}
++
++static long efi_runtime_query_variableinfo(unsigned long arg)
++{
++	struct efi_queryvariableinfo __user *queryvariableinfo_user;
++	struct efi_queryvariableinfo queryvariableinfo;
++	efi_status_t status;
++	u64 max_storage, remaining, max_size;
++
++	queryvariableinfo_user = (struct efi_queryvariableinfo __user *)arg;
++
++	if (copy_from_user(&queryvariableinfo, queryvariableinfo_user,
++			   sizeof(queryvariableinfo)))
++		return -EFAULT;
++
++	status = efi.query_variable_info(queryvariableinfo.attributes,
++					 &max_storage, &remaining, &max_size);
++
++	if (put_user(status, queryvariableinfo.status))
++		return -EFAULT;
++
++	if (status != EFI_SUCCESS)
++		return -EINVAL;
++
++	if (put_user(max_storage,
++		     queryvariableinfo.maximum_variable_storage_size))
++		return -EFAULT;
++
++	if (put_user(remaining,
++		     queryvariableinfo.remaining_variable_storage_size))
++		return -EFAULT;
++
++	if (put_user(max_size, queryvariableinfo.maximum_variable_size))
++		return -EFAULT;
++
++	return 0;
++}
++
++static long efi_runtime_query_capsulecaps(unsigned long arg)
++{
++	struct efi_querycapsulecapabilities __user *qcaps_user;
++	struct efi_querycapsulecapabilities qcaps;
++	efi_capsule_header_t *capsules;
++	efi_status_t status;
++	u64 max_size;
++	int i, reset_type;
++	int rv = 0;
++
++	qcaps_user = (struct efi_querycapsulecapabilities __user *)arg;
++
++	if (copy_from_user(&qcaps, qcaps_user, sizeof(qcaps)))
++		return -EFAULT;
++
++	if (qcaps.capsule_count == ULONG_MAX)
++		return -EINVAL;
++
++	capsules = kcalloc(qcaps.capsule_count + 1,
++			   sizeof(efi_capsule_header_t), GFP_KERNEL);
++	if (!capsules)
++		return -ENOMEM;
++
++	for (i = 0; i < qcaps.capsule_count; i++) {
++		efi_capsule_header_t *c;
++		/*
++		 * We cannot dereference qcaps.capsule_header_array directly to
++		 * obtain the address of the capsule as it resides in the
++		 * user space
++		 */
++		if (get_user(c, qcaps.capsule_header_array + i)) {
++			rv = -EFAULT;
++			goto out;
++		}
++		if (copy_from_user(&capsules[i], c,
++				sizeof(efi_capsule_header_t))) {
++			rv = -EFAULT;
++			goto out;
++		}
++	}
++
++	qcaps.capsule_header_array = &capsules;
++
++	status = efi.query_capsule_caps((efi_capsule_header_t **)
++					qcaps.capsule_header_array,
++					qcaps.capsule_count,
++					&max_size, &reset_type);
++
++	if (put_user(status, qcaps.status)) {
++		rv = -EFAULT;
++		goto out;
++	}
++
++	if (status != EFI_SUCCESS) {
++		rv = -EINVAL;
++		goto out;
++	}
++
++	if (put_user(max_size, qcaps.maximum_capsule_size)) {
++		rv = -EFAULT;
++		goto out;
++	}
++
++	if (put_user(reset_type, qcaps.reset_type))
++		rv = -EFAULT;
++
++out:
++	kfree(capsules);
++	return rv;
++}
++
++static long efi_test_ioctl(struct file *file, unsigned int cmd,
++							unsigned long arg)
++{
++	switch (cmd) {
++	case EFI_RUNTIME_GET_VARIABLE:
++		return efi_runtime_get_variable(arg);
++
++	case EFI_RUNTIME_SET_VARIABLE:
++		return efi_runtime_set_variable(arg);
++
++	case EFI_RUNTIME_GET_TIME:
++		return efi_runtime_get_time(arg);
++
++	case EFI_RUNTIME_SET_TIME:
++		return efi_runtime_set_time(arg);
++
++	case EFI_RUNTIME_GET_WAKETIME:
++		return efi_runtime_get_waketime(arg);
++
++	case EFI_RUNTIME_SET_WAKETIME:
++		return efi_runtime_set_waketime(arg);
++
++	case EFI_RUNTIME_GET_NEXTVARIABLENAME:
++		return efi_runtime_get_nextvariablename(arg);
++
++	case EFI_RUNTIME_GET_NEXTHIGHMONOTONICCOUNT:
++		return efi_runtime_get_nexthighmonocount(arg);
++
++	case EFI_RUNTIME_QUERY_VARIABLEINFO:
++		return efi_runtime_query_variableinfo(arg);
++
++	case EFI_RUNTIME_QUERY_CAPSULECAPABILITIES:
++		return efi_runtime_query_capsulecaps(arg);
++
++	case EFI_RUNTIME_RESET_SYSTEM:
++		return efi_runtime_reset_system(arg);
++	}
++
++	return -ENOTTY;
++}
++
++static int efi_test_open(struct inode *inode, struct file *file)
++{
++	int ret = security_locked_down(LOCKDOWN_EFI_TEST);
++
++	if (ret)
++		return ret;
++
++	if (!capable(CAP_SYS_ADMIN))
++		return -EACCES;
++	/*
++	 * nothing special to do here
++	 * We do accept multiple open files at the same time as we
++	 * synchronize on the per call operation.
++	 */
++	return 0;
++}
++
++static int efi_test_close(struct inode *inode, struct file *file)
++{
++	return 0;
++}
++
++/*
++ *	The various file operations we support.
++ */
++static const struct file_operations efi_test_fops = {
++	.owner		= THIS_MODULE,
++	.unlocked_ioctl	= efi_test_ioctl,
++	.open		= efi_test_open,
++	.release	= efi_test_close,
++	.llseek		= no_llseek,
++};
++
++static struct miscdevice efi_test_dev = {
++	MISC_DYNAMIC_MINOR,
++	"efi_test",
++	&efi_test_fops
++};
++
++static int __init efi_test_init(void)
++{
++	int ret;
++
++	ret = misc_register(&efi_test_dev);
++	if (ret) {
++		pr_err("efi_test: can't misc_register on minor=%d\n",
++			MISC_DYNAMIC_MINOR);
++		return ret;
++	}
++
++	return 0;
++}
++
++static void __exit efi_test_exit(void)
++{
++	misc_deregister(&efi_test_dev);
++}
++
++module_init(efi_test_init);
++module_exit(efi_test_exit);
+diff --git a/drivers/firmware/efi/test/efi_test.h b/drivers/firmware/efi/test/efi_test.h
+new file mode 100644
+index 000000000..f2446aa1c
+--- /dev/null
++++ b/drivers/firmware/efi/test/efi_test.h
+@@ -0,0 +1,121 @@
++/* SPDX-License-Identifier: GPL-2.0+ */
++/*
++ * EFI Test driver Header
++ *
++ * Copyright(C) 2012-2016 Canonical Ltd.
++ *
++ */
++
++#ifndef _DRIVERS_FIRMWARE_EFI_TEST_H_
++#define _DRIVERS_FIRMWARE_EFI_TEST_H_
++
++#include <linux/efi.h>
++
++struct efi_getvariable {
++	efi_char16_t	*variable_name;
++	efi_guid_t	*vendor_guid;
++	u32		*attributes;
++	unsigned long	*data_size;
++	void		*data;
++	efi_status_t	*status;
++} __packed;
++
++struct efi_setvariable {
++	efi_char16_t	*variable_name;
++	efi_guid_t	*vendor_guid;
++	u32		attributes;
++	unsigned long	data_size;
++	void		*data;
++	efi_status_t	*status;
++} __packed;
++
++struct efi_getnextvariablename {
++	unsigned long	*variable_name_size;
++	efi_char16_t	*variable_name;
++	efi_guid_t	*vendor_guid;
++	efi_status_t	*status;
++} __packed;
++
++struct efi_queryvariableinfo {
++	u32		attributes;
++	u64		*maximum_variable_storage_size;
++	u64		*remaining_variable_storage_size;
++	u64		*maximum_variable_size;
++	efi_status_t	*status;
++} __packed;
++
++struct efi_gettime {
++	efi_time_t	*time;
++	efi_time_cap_t	*capabilities;
++	efi_status_t	*status;
++} __packed;
++
++struct efi_settime {
++	efi_time_t	*time;
++	efi_status_t	*status;
++} __packed;
++
++struct efi_getwakeuptime {
++	efi_bool_t	*enabled;
++	efi_bool_t	*pending;
++	efi_time_t	*time;
++	efi_status_t	*status;
++} __packed;
++
++struct efi_setwakeuptime {
++	efi_bool_t	enabled;
++	efi_time_t	*time;
++	efi_status_t	*status;
++} __packed;
++
++struct efi_getnexthighmonotoniccount {
++	u32		*high_count;
++	efi_status_t	*status;
++} __packed;
++
++struct efi_querycapsulecapabilities {
++	efi_capsule_header_t	**capsule_header_array;
++	unsigned long		capsule_count;
++	u64			*maximum_capsule_size;
++	int			*reset_type;
++	efi_status_t		*status;
++} __packed;
++
++struct efi_resetsystem {
++	int			reset_type;
++	efi_status_t		status;
++	unsigned long		data_size;
++	efi_char16_t		*data;
++} __packed;
++
++#define EFI_RUNTIME_GET_VARIABLE \
++	_IOWR('p', 0x01, struct efi_getvariable)
++#define EFI_RUNTIME_SET_VARIABLE \
++	_IOW('p', 0x02, struct efi_setvariable)
++
++#define EFI_RUNTIME_GET_TIME \
++	_IOR('p', 0x03, struct efi_gettime)
++#define EFI_RUNTIME_SET_TIME \
++	_IOW('p', 0x04, struct efi_settime)
++
++#define EFI_RUNTIME_GET_WAKETIME \
++	_IOR('p', 0x05, struct efi_getwakeuptime)
++#define EFI_RUNTIME_SET_WAKETIME \
++	_IOW('p', 0x06, struct efi_setwakeuptime)
++
++#define EFI_RUNTIME_GET_NEXTVARIABLENAME \
++	_IOWR('p', 0x07, struct efi_getnextvariablename)
++
++#define EFI_RUNTIME_QUERY_VARIABLEINFO \
++	_IOR('p', 0x08, struct efi_queryvariableinfo)
++
++#define EFI_RUNTIME_GET_NEXTHIGHMONOTONICCOUNT \
++	_IOR('p', 0x09, struct efi_getnexthighmonotoniccount)
++
++#define EFI_RUNTIME_QUERY_CAPSULECAPABILITIES \
++	_IOR('p', 0x0A, struct efi_querycapsulecapabilities)
++
++#define EFI_RUNTIME_RESET_SYSTEM \
++	_IOW('p', 0x0B, struct efi_resetsystem)
++
++#endif /* _DRIVERS_FIRMWARE_EFI_TEST_H_ */
+diff --git a/drivers/ntb/test/Kconfig b/drivers/ntb/test/Kconfig
+new file mode 100644
+index 000000000..516b991f3
+--- /dev/null
++++ b/drivers/ntb/test/Kconfig
+@@ -0,0 +1,37 @@
++# SPDX-License-Identifier: GPL-2.0-only
++config NTB_PINGPONG
++	tristate "NTB Ping Pong Test Client"
++	help
++	 This is a simple ping pong driver that exercises the scratchpads and
++	 doorbells of the ntb hardware.  This driver may be used to test that
++	 your ntb hardware and drivers are functioning at a basic level.
++
++	 If unsure, say N.
++
++config NTB_TOOL
++	tristate "NTB Debugging Tool Test Client"
++	help
++	 This is a simple debugging driver that enables the doorbell and
++	 scratchpad registers to be read and written from the debugfs.  This
++	 enables more complicated debugging to be scripted from user space.
++	 This driver may be used to test that your ntb hardware and drivers are
++	 functioning at a basic level.
++
++	 If unsure, say N.
++
++config NTB_PERF
++	tristate "NTB RAW Perf Measuring Tool"
++	help
++	 This is a tool to measure raw NTB performance by transferring data
++	 to and from the window without additional software interaction.
++
++	 If unsure, say N.
++
++config NTB_MSI_TEST
++	tristate "NTB MSI Test Client"
++	depends on NTB_MSI
++	help
++	  This tool demonstrates the use of the NTB MSI library to
++	  send MSI interrupts between peers.
++
++	  If unsure, say N.
+diff --git a/drivers/ntb/test/Makefile b/drivers/ntb/test/Makefile
+new file mode 100644
+index 000000000..19ed91d8a
+--- /dev/null
++++ b/drivers/ntb/test/Makefile
+@@ -0,0 +1,5 @@
++# SPDX-License-Identifier: GPL-2.0-only
++obj-$(CONFIG_NTB_PINGPONG) += ntb_pingpong.o
++obj-$(CONFIG_NTB_TOOL) += ntb_tool.o
++obj-$(CONFIG_NTB_PERF) += ntb_perf.o
++obj-$(CONFIG_NTB_MSI_TEST) += ntb_msi_test.o
+diff --git a/drivers/ntb/test/ntb_msi_test.c b/drivers/ntb/test/ntb_msi_test.c
+new file mode 100644
+index 000000000..99d826ed9
+--- /dev/null
++++ b/drivers/ntb/test/ntb_msi_test.c
+@@ -0,0 +1,433 @@
++// SPDX-License-Identifier: (GPL-2.0 OR BSD-3-Clause)
++
++#include <linux/module.h>
++#include <linux/debugfs.h>
++#include <linux/ntb.h>
++#include <linux/pci.h>
++#include <linux/radix-tree.h>
++#include <linux/workqueue.h>
++
++MODULE_LICENSE("Dual BSD/GPL");
++MODULE_VERSION("0.1");
++MODULE_AUTHOR("Logan Gunthorpe <logang@deltatee.com>");
++MODULE_DESCRIPTION("Test for sending MSI interrupts over an NTB memory window");
++
++static int num_irqs = 4;
++module_param(num_irqs, int, 0644);
++MODULE_PARM_DESC(num_irqs, "number of irqs to use");
++
++struct ntb_msit_ctx {
++	struct ntb_dev *ntb;
++	struct dentry *dbgfs_dir;
++	struct work_struct setup_work;
++
++	struct ntb_msit_isr_ctx {
++		int irq_idx;
++		int irq_num;
++		int occurrences;
++		struct ntb_msit_ctx *nm;
++		struct ntb_msi_desc desc;
++	} *isr_ctx;
++
++	struct ntb_msit_peer {
++		struct ntb_msit_ctx *nm;
++		int pidx;
++		int num_irqs;
++		struct completion init_comp;
++		struct ntb_msi_desc *msi_desc;
++	} peers[];
++};
++
++static struct dentry *ntb_msit_dbgfs_topdir;
++
++static irqreturn_t ntb_msit_isr(int irq, void *dev)
++{
++	struct ntb_msit_isr_ctx *isr_ctx = dev;
++	struct ntb_msit_ctx *nm = isr_ctx->nm;
++
++	dev_dbg(&nm->ntb->dev, "Interrupt Occurred: %d",
++		isr_ctx->irq_idx);
++
++	isr_ctx->occurrences++;
++
++	return IRQ_HANDLED;
++}
++
++static void ntb_msit_setup_work(struct work_struct *work)
++{
++	struct ntb_msit_ctx *nm = container_of(work, struct ntb_msit_ctx,
++					       setup_work);
++	int irq_count = 0;
++	int irq;
++	int ret;
++	uintptr_t i;
++
++	ret = ntb_msi_setup_mws(nm->ntb);
++	if (ret) {
++		dev_err(&nm->ntb->dev, "Unable to setup MSI windows: %d\n",
++			ret);
++		return;
++	}
++
++	for (i = 0; i < num_irqs; i++) {
++		nm->isr_ctx[i].irq_idx = i;
++		nm->isr_ctx[i].nm = nm;
++
++		if (!nm->isr_ctx[i].irq_num) {
++			irq = ntbm_msi_request_irq(nm->ntb, ntb_msit_isr,
++						   KBUILD_MODNAME,
++						   &nm->isr_ctx[i],
++						   &nm->isr_ctx[i].desc);
++			if (irq < 0)
++				break;
++
++			nm->isr_ctx[i].irq_num = irq;
++		}
++
++		ret = ntb_spad_write(nm->ntb, 2 * i + 1,
++				     nm->isr_ctx[i].desc.addr_offset);
++		if (ret)
++			break;
++
++		ret = ntb_spad_write(nm->ntb, 2 * i + 2,
++				     nm->isr_ctx[i].desc.data);
++		if (ret)
++			break;
++
++		irq_count++;
++	}
++
++	ntb_spad_write(nm->ntb, 0, irq_count);
++	ntb_peer_db_set(nm->ntb, BIT(ntb_port_number(nm->ntb)));
++}
++
++static void ntb_msit_desc_changed(void *ctx)
++{
++	struct ntb_msit_ctx *nm = ctx;
++	int i;
++
++	dev_dbg(&nm->ntb->dev, "MSI Descriptors Changed\n");
++
++	for (i = 0; i < num_irqs; i++) {
++		ntb_spad_write(nm->ntb, 2 * i + 1,
++			       nm->isr_ctx[i].desc.addr_offset);
++		ntb_spad_write(nm->ntb, 2 * i + 2,
++			       nm->isr_ctx[i].desc.data);
++	}
++
++	ntb_peer_db_set(nm->ntb, BIT(ntb_port_number(nm->ntb)));
++}
++
++static void ntb_msit_link_event(void *ctx)
++{
++	struct ntb_msit_ctx *nm = ctx;
++
++	if (!ntb_link_is_up(nm->ntb, NULL, NULL))
++		return;
++
++	schedule_work(&nm->setup_work);
++}
++
++static void ntb_msit_copy_peer_desc(struct ntb_msit_ctx *nm, int peer)
++{
++	int i;
++	struct ntb_msi_desc *desc = nm->peers[peer].msi_desc;
++	int irq_count = nm->peers[peer].num_irqs;
++
++	for (i = 0; i < irq_count; i++) {
++		desc[i].addr_offset = ntb_peer_spad_read(nm->ntb, peer,
++							 2 * i + 1);
++		desc[i].data = ntb_peer_spad_read(nm->ntb, peer, 2 * i + 2);
++	}
++
++	dev_info(&nm->ntb->dev, "Found %d interrupts on peer %d\n",
++		 irq_count, peer);
++
++	complete_all(&nm->peers[peer].init_comp);
++}
++
++static void ntb_msit_db_event(void *ctx, int vec)
++{
++	struct ntb_msit_ctx *nm = ctx;
++	struct ntb_msi_desc *desc;
++	u64 peer_mask = ntb_db_read(nm->ntb);
++	u32 irq_count;
++	int peer;
++
++	ntb_db_clear(nm->ntb, peer_mask);
++
++	for (peer = 0; peer < sizeof(peer_mask) * 8; peer++) {
++		if (!(peer_mask & BIT(peer)))
++			continue;
++
++		irq_count = ntb_peer_spad_read(nm->ntb, peer, 0);
++		if (irq_count == -1)
++			continue;
++
++		desc = kcalloc(irq_count, sizeof(*desc), GFP_ATOMIC);
++		if (!desc)
++			continue;
++
++		kfree(nm->peers[peer].msi_desc);
++		nm->peers[peer].msi_desc = desc;
++		nm->peers[peer].num_irqs = irq_count;
++
++		ntb_msit_copy_peer_desc(nm, peer);
++	}
++}
++
++static const struct ntb_ctx_ops ntb_msit_ops = {
++	.link_event = ntb_msit_link_event,
++	.db_event = ntb_msit_db_event,
++};
++
++static int ntb_msit_dbgfs_trigger(void *data, u64 idx)
++{
++	struct ntb_msit_peer *peer = data;
++
++	if (idx >= peer->num_irqs)
++		return -EINVAL;
++
++	dev_dbg(&peer->nm->ntb->dev, "trigger irq %llu on peer %u\n",
++		idx, peer->pidx);
++
++	return ntb_msi_peer_trigger(peer->nm->ntb, peer->pidx,
++				    &peer->msi_desc[idx]);
++}
++
++DEFINE_DEBUGFS_ATTRIBUTE(ntb_msit_trigger_fops, NULL,
++			 ntb_msit_dbgfs_trigger, "%llu\n");
++
++static int ntb_msit_dbgfs_port_get(void *data, u64 *port)
++{
++	struct ntb_msit_peer *peer = data;
++
++	*port = ntb_peer_port_number(peer->nm->ntb, peer->pidx);
++
++	return 0;
++}
++
++DEFINE_DEBUGFS_ATTRIBUTE(ntb_msit_port_fops, ntb_msit_dbgfs_port_get,
++			 NULL, "%llu\n");
++
++static int ntb_msit_dbgfs_count_get(void *data, u64 *count)
++{
++	struct ntb_msit_peer *peer = data;
++
++	*count = peer->num_irqs;
++
++	return 0;
++}
++
++DEFINE_DEBUGFS_ATTRIBUTE(ntb_msit_count_fops, ntb_msit_dbgfs_count_get,
++			 NULL, "%llu\n");
++
++static int ntb_msit_dbgfs_ready_get(void *data, u64 *ready)
++{
++	struct ntb_msit_peer *peer = data;
++
++	*ready = try_wait_for_completion(&peer->init_comp);
++
++	return 0;
++}
++
++static int ntb_msit_dbgfs_ready_set(void *data, u64 ready)
++{
++	struct ntb_msit_peer *peer = data;
++
++	return wait_for_completion_interruptible(&peer->init_comp);
++}
++
++DEFINE_DEBUGFS_ATTRIBUTE(ntb_msit_ready_fops, ntb_msit_dbgfs_ready_get,
++			 ntb_msit_dbgfs_ready_set, "%llu\n");
++
++static int ntb_msit_dbgfs_occurrences_get(void *data, u64 *occurrences)
++{
++	struct ntb_msit_isr_ctx *isr_ctx = data;
++
++	*occurrences = isr_ctx->occurrences;
++
++	return 0;
++}
++
++DEFINE_DEBUGFS_ATTRIBUTE(ntb_msit_occurrences_fops,
++			 ntb_msit_dbgfs_occurrences_get,
++			 NULL, "%llu\n");
++
++static int ntb_msit_dbgfs_local_port_get(void *data, u64 *port)
++{
++	struct ntb_msit_ctx *nm = data;
++
++	*port = ntb_port_number(nm->ntb);
++
++	return 0;
++}
++
++DEFINE_DEBUGFS_ATTRIBUTE(ntb_msit_local_port_fops,
++			 ntb_msit_dbgfs_local_port_get,
++			 NULL, "%llu\n");
++
++static void ntb_msit_create_dbgfs(struct ntb_msit_ctx *nm)
++{
++	struct pci_dev *pdev = nm->ntb->pdev;
++	char buf[32];
++	int i;
++	struct dentry *peer_dir;
++
++	nm->dbgfs_dir = debugfs_create_dir(pci_name(pdev),
++					   ntb_msit_dbgfs_topdir);
++	debugfs_create_file("port", 0400, nm->dbgfs_dir, nm,
++			    &ntb_msit_local_port_fops);
++
++	for (i = 0; i < ntb_peer_port_count(nm->ntb); i++) {
++		nm->peers[i].pidx = i;
++		nm->peers[i].nm = nm;
++		init_completion(&nm->peers[i].init_comp);
++
++		snprintf(buf, sizeof(buf), "peer%d", i);
++		peer_dir = debugfs_create_dir(buf, nm->dbgfs_dir);
++
++		debugfs_create_file_unsafe("trigger", 0200, peer_dir,
++					   &nm->peers[i],
++					   &ntb_msit_trigger_fops);
++
++		debugfs_create_file_unsafe("port", 0400, peer_dir,
++					   &nm->peers[i], &ntb_msit_port_fops);
++
++		debugfs_create_file_unsafe("count", 0400, peer_dir,
++					   &nm->peers[i],
++					   &ntb_msit_count_fops);
++
++		debugfs_create_file_unsafe("ready", 0600, peer_dir,
++					   &nm->peers[i],
++					   &ntb_msit_ready_fops);
++	}
++
++	for (i = 0; i < num_irqs; i++) {
++		snprintf(buf, sizeof(buf), "irq%d_occurrences", i);
++		debugfs_create_file_unsafe(buf, 0400, nm->dbgfs_dir,
++					   &nm->isr_ctx[i],
++					   &ntb_msit_occurrences_fops);
++	}
++}
++
++static void ntb_msit_remove_dbgfs(struct ntb_msit_ctx *nm)
++{
++	debugfs_remove_recursive(nm->dbgfs_dir);
++}
++
++static int ntb_msit_probe(struct ntb_client *client, struct ntb_dev *ntb)
++{
++	struct ntb_msit_ctx *nm;
++	size_t struct_size;
++	int peers;
++	int ret;
++
++	peers = ntb_peer_port_count(ntb);
++	if (peers <= 0)
++		return -EINVAL;
++
++	if (ntb_spad_is_unsafe(ntb) || ntb_spad_count(ntb) < 2 * num_irqs + 1) {
++		dev_err(&ntb->dev, "NTB MSI test requires at least %d spads for %d irqs\n",
++			2 * num_irqs + 1, num_irqs);
++		return -EFAULT;
++	}
++
++	ret = ntb_spad_write(ntb, 0, -1);
++	if (ret) {
++		dev_err(&ntb->dev, "Unable to write spads: %d\n", ret);
++		return ret;
++	}
++
++	ret = ntb_db_clear_mask(ntb, GENMASK(peers - 1, 0));
++	if (ret) {
++		dev_err(&ntb->dev, "Unable to clear doorbell mask: %d\n", ret);
++		return ret;
++	}
++
++	ret = ntb_msi_init(ntb, ntb_msit_desc_changed);
++	if (ret) {
++		dev_err(&ntb->dev, "Unable to initialize MSI library: %d\n",
++			ret);
++		return ret;
++	}
++
++	struct_size = sizeof(*nm) + sizeof(*nm->peers) * peers;
++
++	nm = devm_kzalloc(&ntb->dev, struct_size, GFP_KERNEL);
++	if (!nm)
++		return -ENOMEM;
++
++	nm->isr_ctx = devm_kcalloc(&ntb->dev, num_irqs, sizeof(*nm->isr_ctx),
++				   GFP_KERNEL);
++	if (!nm->isr_ctx)
++		return -ENOMEM;
++
++	INIT_WORK(&nm->setup_work, ntb_msit_setup_work);
++	nm->ntb = ntb;
++
++	ntb_msit_create_dbgfs(nm);
++
++	ret = ntb_set_ctx(ntb, nm, &ntb_msit_ops);
++	if (ret)
++		goto remove_dbgfs;
++
++	if (!nm->isr_ctx)
++		goto remove_dbgfs;
++
++	ntb_link_enable(ntb, NTB_SPEED_AUTO, NTB_WIDTH_AUTO);
++
++	return 0;
++
++remove_dbgfs:
++	ntb_msit_remove_dbgfs(nm);
++	devm_kfree(&ntb->dev, nm->isr_ctx);
++	devm_kfree(&ntb->dev, nm);
++	return ret;
++}
++
++static void ntb_msit_remove(struct ntb_client *client, struct ntb_dev *ntb)
++{
++	struct ntb_msit_ctx *nm = ntb->ctx;
++	int i;
++
++	ntb_link_disable(ntb);
++	ntb_db_set_mask(ntb, ntb_db_valid_mask(ntb));
++	ntb_msi_clear_mws(ntb);
++
++	for (i = 0; i < ntb_peer_port_count(ntb); i++)
++		kfree(nm->peers[i].msi_desc);
++
++	ntb_clear_ctx(ntb);
++	ntb_msit_remove_dbgfs(nm);
++}
++
++static struct ntb_client ntb_msit_client = {
++	.ops = {
++		.probe = ntb_msit_probe,
++		.remove = ntb_msit_remove
++	}
++};
++
++static int __init ntb_msit_init(void)
++{
++	int ret;
++
++	if (debugfs_initialized())
++		ntb_msit_dbgfs_topdir = debugfs_create_dir(KBUILD_MODNAME,
++							   NULL);
++
++	ret = ntb_register_client(&ntb_msit_client);
++	if (ret)
++		debugfs_remove_recursive(ntb_msit_dbgfs_topdir);
++
++	return ret;
++}
++module_init(ntb_msit_init);
++
++static void __exit ntb_msit_exit(void)
++{
++	ntb_unregister_client(&ntb_msit_client);
++	debugfs_remove_recursive(ntb_msit_dbgfs_topdir);
++}
++module_exit(ntb_msit_exit);
+diff --git a/drivers/ntb/test/ntb_perf.c b/drivers/ntb/test/ntb_perf.c
+new file mode 100644
+index 000000000..5ce4766a6
+--- /dev/null
++++ b/drivers/ntb/test/ntb_perf.c
+@@ -0,0 +1,1536 @@
++/*
++ * This file is provided under a dual BSD/GPLv2 license.  When using or
++ *   redistributing this file, you may do so under either license.
++ *
++ *   GPL LICENSE SUMMARY
++ *
++ *   Copyright(c) 2015 Intel Corporation. All rights reserved.
++ *   Copyright(c) 2017 T-Platforms. All Rights Reserved.
++ *
++ *   This program is free software; you can redistribute it and/or modify
++ *   it under the terms of version 2 of the GNU General Public License as
++ *   published by the Free Software Foundation.
++ *
++ *   BSD LICENSE
++ *
++ *   Copyright(c) 2015 Intel Corporation. All rights reserved.
++ *   Copyright(c) 2017 T-Platforms. All Rights Reserved.
++ *
++ *   Redistribution and use in source and binary forms, with or without
++ *   modification, are permitted provided that the following conditions
++ *   are met:
++ *
++ *     * Redistributions of source code must retain the above copyright
++ *       notice, this list of conditions and the following disclaimer.
++ *     * Redistributions in binary form must reproduce the above copy
++ *       notice, this list of conditions and the following disclaimer in
++ *       the documentation and/or other materials provided with the
++ *       distribution.
++ *     * Neither the name of Intel Corporation nor the names of its
++ *       contributors may be used to endorse or promote products derived
++ *       from this software without specific prior written permission.
++ *
++ *   THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS
++ *   "AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT
++ *   LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR
++ *   A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT
++ *   OWNER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL,
++ *   SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT
++ *   LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE,
++ *   DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY
++ *   THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
++ *   (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
++ *   OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
++ *
++ * PCIe NTB Perf Linux driver
++ */
++
++/*
++ * How to use this tool, by example.
++ *
++ * Assuming $DBG_DIR is something like:
++ * '/sys/kernel/debug/ntb_perf/0000:00:03.0'
++ * Suppose aside from local device there is at least one remote device
++ * connected to NTB with index 0.
++ *-----------------------------------------------------------------------------
++ * Eg: install driver with specified chunk/total orders and dma-enabled flag
++ *
++ * root@self# insmod ntb_perf.ko chunk_order=19 total_order=28 use_dma
++ *-----------------------------------------------------------------------------
++ * Eg: check NTB ports (index) and MW mapping information
++ *
++ * root@self# cat $DBG_DIR/info
++ *-----------------------------------------------------------------------------
++ * Eg: start performance test with peer (index 0) and get the test metrics
++ *
++ * root@self# echo 0 > $DBG_DIR/run
++ * root@self# cat $DBG_DIR/run
++ */
++
++#include <linux/init.h>
++#include <linux/kernel.h>
++#include <linux/module.h>
++#include <linux/sched.h>
++#include <linux/wait.h>
++#include <linux/dma-mapping.h>
++#include <linux/dmaengine.h>
++#include <linux/pci.h>
++#include <linux/ktime.h>
++#include <linux/slab.h>
++#include <linux/delay.h>
++#include <linux/sizes.h>
++#include <linux/workqueue.h>
++#include <linux/debugfs.h>
++#include <linux/random.h>
++#include <linux/ntb.h>
++
++#define DRIVER_NAME		"ntb_perf"
++#define DRIVER_VERSION		"2.0"
++
++MODULE_LICENSE("Dual BSD/GPL");
++MODULE_VERSION(DRIVER_VERSION);
++MODULE_AUTHOR("Dave Jiang <dave.jiang@intel.com>");
++MODULE_DESCRIPTION("PCIe NTB Performance Measurement Tool");
++
++#define MAX_THREADS_CNT		32
++#define DEF_THREADS_CNT		1
++#define MAX_CHUNK_SIZE		SZ_1M
++#define MAX_CHUNK_ORDER		20 /* no larger than 1M */
++
++#define DMA_TRIES		100
++#define DMA_MDELAY		10
++
++#define MSG_TRIES		1000
++#define MSG_UDELAY_LOW		1000
++#define MSG_UDELAY_HIGH		2000
++
++#define PERF_BUF_LEN 1024
++
++static unsigned long max_mw_size;
++module_param(max_mw_size, ulong, 0644);
++MODULE_PARM_DESC(max_mw_size, "Upper limit of memory window size");
++
++static unsigned char chunk_order = 19; /* 512K */
++module_param(chunk_order, byte, 0644);
++MODULE_PARM_DESC(chunk_order, "Data chunk order [2^n] to transfer");
++
++static unsigned char total_order = 30; /* 1G */
++module_param(total_order, byte, 0644);
++MODULE_PARM_DESC(total_order, "Total data order [2^n] to transfer");
++
++static bool use_dma; /* default to 0 */
++module_param(use_dma, bool, 0644);
++MODULE_PARM_DESC(use_dma, "Use DMA engine to measure performance");
++
++/*==============================================================================
++ *                         Perf driver data definition
++ *==============================================================================
++ */
++
++enum perf_cmd {
++	PERF_CMD_INVAL = -1,/* invalid spad command */
++	PERF_CMD_SSIZE = 0, /* send out buffer size */
++	PERF_CMD_RSIZE = 1, /* recv in  buffer size */
++	PERF_CMD_SXLAT = 2, /* send in  buffer xlat */
++	PERF_CMD_RXLAT = 3, /* recv out buffer xlat */
++	PERF_CMD_CLEAR = 4, /* clear allocated memory */
++	PERF_STS_DONE  = 5, /* init is done */
++	PERF_STS_LNKUP = 6, /* link up state flag */
++};
++
++struct perf_ctx;
++
++struct perf_peer {
++	struct perf_ctx	*perf;
++	int pidx;
++	int gidx;
++
++	/* Outbound MW params */
++	u64 outbuf_xlat;
++	resource_size_t outbuf_size;
++	void __iomem *outbuf;
++
++	/* Inbound MW params */
++	dma_addr_t inbuf_xlat;
++	resource_size_t inbuf_size;
++	void		*inbuf;
++
++	/* NTB connection setup service */
++	struct work_struct	service;
++	unsigned long		sts;
++
++	struct completion init_comp;
++};
++#define to_peer_service(__work) \
++	container_of(__work, struct perf_peer, service)
++
++struct perf_thread {
++	struct perf_ctx *perf;
++	int tidx;
++
++	/* DMA-based test sync parameters */
++	atomic_t dma_sync;
++	wait_queue_head_t dma_wait;
++	struct dma_chan *dma_chan;
++
++	/* Data source and measured statistics */
++	void *src;
++	u64 copied;
++	ktime_t duration;
++	int status;
++	struct work_struct work;
++};
++#define to_thread_work(__work) \
++	container_of(__work, struct perf_thread, work)
++
++struct perf_ctx {
++	struct ntb_dev *ntb;
++
++	/* Global device index and peers descriptors */
++	int gidx;
++	int pcnt;
++	struct perf_peer *peers;
++
++	/* Performance measuring work-threads interface */
++	unsigned long busy_flag;
++	wait_queue_head_t twait;
++	atomic_t tsync;
++	u8 tcnt;
++	struct perf_peer *test_peer;
++	struct perf_thread threads[MAX_THREADS_CNT];
++
++	/* Scratchpad/Message IO operations */
++	int (*cmd_send)(struct perf_peer *peer, enum perf_cmd cmd, u64 data);
++	int (*cmd_recv)(struct perf_ctx *perf, int *pidx, enum perf_cmd *cmd,
++			u64 *data);
++
++	struct dentry *dbgfs_dir;
++};
++
++/*
++ * Scratchpads-base commands interface
++ */
++#define PERF_SPAD_CNT(_pcnt) \
++	(3*((_pcnt) + 1))
++#define PERF_SPAD_CMD(_gidx) \
++	(3*(_gidx))
++#define PERF_SPAD_LDATA(_gidx) \
++	(3*(_gidx) + 1)
++#define PERF_SPAD_HDATA(_gidx) \
++	(3*(_gidx) + 2)
++#define PERF_SPAD_NOTIFY(_gidx) \
++	(BIT_ULL(_gidx))
++
++/*
++ * Messages-base commands interface
++ */
++#define PERF_MSG_CNT		3
++#define PERF_MSG_CMD		0
++#define PERF_MSG_LDATA		1
++#define PERF_MSG_HDATA		2
++
++/*==============================================================================
++ *                           Static data declarations
++ *==============================================================================
++ */
++
++static struct dentry *perf_dbgfs_topdir;
++
++static struct workqueue_struct *perf_wq __read_mostly;
++
++/*==============================================================================
++ *                  NTB cross-link commands execution service
++ *==============================================================================
++ */
++
++static void perf_terminate_test(struct perf_ctx *perf);
++
++static inline bool perf_link_is_up(struct perf_peer *peer)
++{
++	u64 link;
++
++	link = ntb_link_is_up(peer->perf->ntb, NULL, NULL);
++	return !!(link & BIT_ULL_MASK(peer->pidx));
++}
++
++static int perf_spad_cmd_send(struct perf_peer *peer, enum perf_cmd cmd,
++			      u64 data)
++{
++	struct perf_ctx *perf = peer->perf;
++	int try;
++	u32 sts;
++
++	dev_dbg(&perf->ntb->dev, "CMD send: %d 0x%llx\n", cmd, data);
++
++	/*
++	 * Perform predefined number of attempts before give up.
++	 * We are sending the data to the port specific scratchpad, so
++	 * to prevent a multi-port access race-condition. Additionally
++	 * there is no need in local locking since only thread-safe
++	 * service work is using this method.
++	 */
++	for (try = 0; try < MSG_TRIES; try++) {
++		if (!perf_link_is_up(peer))
++			return -ENOLINK;
++
++		sts = ntb_peer_spad_read(perf->ntb, peer->pidx,
++					 PERF_SPAD_CMD(perf->gidx));
++		if (sts != PERF_CMD_INVAL) {
++			usleep_range(MSG_UDELAY_LOW, MSG_UDELAY_HIGH);
++			continue;
++		}
++
++		ntb_peer_spad_write(perf->ntb, peer->pidx,
++				    PERF_SPAD_LDATA(perf->gidx),
++				    lower_32_bits(data));
++		ntb_peer_spad_write(perf->ntb, peer->pidx,
++				    PERF_SPAD_HDATA(perf->gidx),
++				    upper_32_bits(data));
++		ntb_peer_spad_write(perf->ntb, peer->pidx,
++				    PERF_SPAD_CMD(perf->gidx),
++				    cmd);
++		ntb_peer_db_set(perf->ntb, PERF_SPAD_NOTIFY(peer->gidx));
++
++		dev_dbg(&perf->ntb->dev, "DB ring peer %#llx\n",
++			PERF_SPAD_NOTIFY(peer->gidx));
++
++		break;
++	}
++
++	return try < MSG_TRIES ? 0 : -EAGAIN;
++}
++
++static int perf_spad_cmd_recv(struct perf_ctx *perf, int *pidx,
++			      enum perf_cmd *cmd, u64 *data)
++{
++	struct perf_peer *peer;
++	u32 val;
++
++	ntb_db_clear(perf->ntb, PERF_SPAD_NOTIFY(perf->gidx));
++
++	/*
++	 * We start scanning all over, since cleared DB may have been set
++	 * by any peer. Yes, it makes peer with smaller index being
++	 * serviced with greater priority, but it's convenient for spad
++	 * and message code unification and simplicity.
++	 */
++	for (*pidx = 0; *pidx < perf->pcnt; (*pidx)++) {
++		peer = &perf->peers[*pidx];
++
++		if (!perf_link_is_up(peer))
++			continue;
++
++		val = ntb_spad_read(perf->ntb, PERF_SPAD_CMD(peer->gidx));
++		if (val == PERF_CMD_INVAL)
++			continue;
++
++		*cmd = val;
++
++		val = ntb_spad_read(perf->ntb, PERF_SPAD_LDATA(peer->gidx));
++		*data = val;
++
++		val = ntb_spad_read(perf->ntb, PERF_SPAD_HDATA(peer->gidx));
++		*data |= (u64)val << 32;
++
++		/* Next command can be retrieved from now */
++		ntb_spad_write(perf->ntb, PERF_SPAD_CMD(peer->gidx),
++			       PERF_CMD_INVAL);
++
++		dev_dbg(&perf->ntb->dev, "CMD recv: %d 0x%llx\n", *cmd, *data);
++
++		return 0;
++	}
++
++	return -ENODATA;
++}
++
++static int perf_msg_cmd_send(struct perf_peer *peer, enum perf_cmd cmd,
++			     u64 data)
++{
++	struct perf_ctx *perf = peer->perf;
++	int try, ret;
++	u64 outbits;
++
++	dev_dbg(&perf->ntb->dev, "CMD send: %d 0x%llx\n", cmd, data);
++
++	/*
++	 * Perform predefined number of attempts before give up. Message
++	 * registers are free of race-condition problem when accessed
++	 * from different ports, so we don't need splitting registers
++	 * by global device index. We also won't have local locking,
++	 * since the method is used from service work only.
++	 */
++	outbits = ntb_msg_outbits(perf->ntb);
++	for (try = 0; try < MSG_TRIES; try++) {
++		if (!perf_link_is_up(peer))
++			return -ENOLINK;
++
++		ret = ntb_msg_clear_sts(perf->ntb, outbits);
++		if (ret)
++			return ret;
++
++		ntb_peer_msg_write(perf->ntb, peer->pidx, PERF_MSG_LDATA,
++				   lower_32_bits(data));
++
++		if (ntb_msg_read_sts(perf->ntb) & outbits) {
++			usleep_range(MSG_UDELAY_LOW, MSG_UDELAY_HIGH);
++			continue;
++		}
++
++		ntb_peer_msg_write(perf->ntb, peer->pidx, PERF_MSG_HDATA,
++				   upper_32_bits(data));
++
++		/* This call shall trigger peer message event */
++		ntb_peer_msg_write(perf->ntb, peer->pidx, PERF_MSG_CMD, cmd);
++
++		break;
++	}
++
++	return try < MSG_TRIES ? 0 : -EAGAIN;
++}
++
++static int perf_msg_cmd_recv(struct perf_ctx *perf, int *pidx,
++			     enum perf_cmd *cmd, u64 *data)
++{
++	u64 inbits;
++	u32 val;
++
++	inbits = ntb_msg_inbits(perf->ntb);
++
++	if (hweight64(ntb_msg_read_sts(perf->ntb) & inbits) < 3)
++		return -ENODATA;
++
++	val = ntb_msg_read(perf->ntb, pidx, PERF_MSG_CMD);
++	*cmd = val;
++
++	val = ntb_msg_read(perf->ntb, pidx, PERF_MSG_LDATA);
++	*data = val;
++
++	val = ntb_msg_read(perf->ntb, pidx, PERF_MSG_HDATA);
++	*data |= (u64)val << 32;
++
++	/* Next command can be retrieved from now */
++	ntb_msg_clear_sts(perf->ntb, inbits);
++
++	dev_dbg(&perf->ntb->dev, "CMD recv: %d 0x%llx\n", *cmd, *data);
++
++	return 0;
++}
++
++static int perf_cmd_send(struct perf_peer *peer, enum perf_cmd cmd, u64 data)
++{
++	struct perf_ctx *perf = peer->perf;
++
++	if (cmd == PERF_CMD_SSIZE || cmd == PERF_CMD_SXLAT)
++		return perf->cmd_send(peer, cmd, data);
++
++	dev_err(&perf->ntb->dev, "Send invalid command\n");
++	return -EINVAL;
++}
++
++static int perf_cmd_exec(struct perf_peer *peer, enum perf_cmd cmd)
++{
++	switch (cmd) {
++	case PERF_CMD_SSIZE:
++	case PERF_CMD_RSIZE:
++	case PERF_CMD_SXLAT:
++	case PERF_CMD_RXLAT:
++	case PERF_CMD_CLEAR:
++		break;
++	default:
++		dev_err(&peer->perf->ntb->dev, "Exec invalid command\n");
++		return -EINVAL;
++	}
++
++	/* No need of memory barrier, since bit ops have invernal lock */
++	set_bit(cmd, &peer->sts);
++
++	dev_dbg(&peer->perf->ntb->dev, "CMD exec: %d\n", cmd);
++
++	(void)queue_work(system_highpri_wq, &peer->service);
++
++	return 0;
++}
++
++static int perf_cmd_recv(struct perf_ctx *perf)
++{
++	struct perf_peer *peer;
++	int ret, pidx, cmd;
++	u64 data;
++
++	while (!(ret = perf->cmd_recv(perf, &pidx, &cmd, &data))) {
++		peer = &perf->peers[pidx];
++
++		switch (cmd) {
++		case PERF_CMD_SSIZE:
++			peer->inbuf_size = data;
++			return perf_cmd_exec(peer, PERF_CMD_RSIZE);
++		case PERF_CMD_SXLAT:
++			peer->outbuf_xlat = data;
++			return perf_cmd_exec(peer, PERF_CMD_RXLAT);
++		default:
++			dev_err(&perf->ntb->dev, "Recv invalid command\n");
++			return -EINVAL;
++		}
++	}
++
++	/* Return 0 if no data left to process, otherwise an error */
++	return ret == -ENODATA ? 0 : ret;
++}
++
++static void perf_link_event(void *ctx)
++{
++	struct perf_ctx *perf = ctx;
++	struct perf_peer *peer;
++	bool lnk_up;
++	int pidx;
++
++	for (pidx = 0; pidx < perf->pcnt; pidx++) {
++		peer = &perf->peers[pidx];
++
++		lnk_up = perf_link_is_up(peer);
++
++		if (lnk_up &&
++		    !test_and_set_bit(PERF_STS_LNKUP, &peer->sts)) {
++			perf_cmd_exec(peer, PERF_CMD_SSIZE);
++		} else if (!lnk_up &&
++			   test_and_clear_bit(PERF_STS_LNKUP, &peer->sts)) {
++			perf_cmd_exec(peer, PERF_CMD_CLEAR);
++		}
++	}
++}
++
++static void perf_db_event(void *ctx, int vec)
++{
++	struct perf_ctx *perf = ctx;
++
++	dev_dbg(&perf->ntb->dev, "DB vec %d mask %#llx bits %#llx\n", vec,
++		ntb_db_vector_mask(perf->ntb, vec), ntb_db_read(perf->ntb));
++
++	/* Just receive all available commands */
++	(void)perf_cmd_recv(perf);
++}
++
++static void perf_msg_event(void *ctx)
++{
++	struct perf_ctx *perf = ctx;
++
++	dev_dbg(&perf->ntb->dev, "Msg status bits %#llx\n",
++		ntb_msg_read_sts(perf->ntb));
++
++	/* Messages are only sent one-by-one */
++	(void)perf_cmd_recv(perf);
++}
++
++static const struct ntb_ctx_ops perf_ops = {
++	.link_event = perf_link_event,
++	.db_event = perf_db_event,
++	.msg_event = perf_msg_event
++};
++
++static void perf_free_outbuf(struct perf_peer *peer)
++{
++	(void)ntb_peer_mw_clear_trans(peer->perf->ntb, peer->pidx, peer->gidx);
++}
++
++static int perf_setup_outbuf(struct perf_peer *peer)
++{
++	struct perf_ctx *perf = peer->perf;
++	int ret;
++
++	/* Outbuf size can be unaligned due to custom max_mw_size */
++	ret = ntb_peer_mw_set_trans(perf->ntb, peer->pidx, peer->gidx,
++				    peer->outbuf_xlat, peer->outbuf_size);
++	if (ret) {
++		dev_err(&perf->ntb->dev, "Failed to set outbuf translation\n");
++		return ret;
++	}
++
++	/* Initialization is finally done */
++	set_bit(PERF_STS_DONE, &peer->sts);
++	complete_all(&peer->init_comp);
++
++	return 0;
++}
++
++static void perf_free_inbuf(struct perf_peer *peer)
++{
++	if (!peer->inbuf)
++		return;
++
++	(void)ntb_mw_clear_trans(peer->perf->ntb, peer->pidx, peer->gidx);
++	dma_free_coherent(&peer->perf->ntb->pdev->dev, peer->inbuf_size,
++			  peer->inbuf, peer->inbuf_xlat);
++	peer->inbuf = NULL;
++}
++
++static int perf_setup_inbuf(struct perf_peer *peer)
++{
++	resource_size_t xlat_align, size_align, size_max;
++	struct perf_ctx *perf = peer->perf;
++	int ret;
++
++	/* Get inbound MW parameters */
++	ret = ntb_mw_get_align(perf->ntb, peer->pidx, perf->gidx,
++			       &xlat_align, &size_align, &size_max);
++	if (ret) {
++		dev_err(&perf->ntb->dev, "Couldn't get inbuf restrictions\n");
++		return ret;
++	}
++
++	if (peer->inbuf_size > size_max) {
++		dev_err(&perf->ntb->dev, "Too big inbuf size %pa > %pa\n",
++			&peer->inbuf_size, &size_max);
++		return -EINVAL;
++	}
++
++	peer->inbuf_size = round_up(peer->inbuf_size, size_align);
++
++	perf_free_inbuf(peer);
++
++	peer->inbuf = dma_alloc_coherent(&perf->ntb->pdev->dev,
++					 peer->inbuf_size, &peer->inbuf_xlat,
++					 GFP_KERNEL);
++	if (!peer->inbuf) {
++		dev_err(&perf->ntb->dev, "Failed to alloc inbuf of %pa\n",
++			&peer->inbuf_size);
++		return -ENOMEM;
++	}
++	if (!IS_ALIGNED(peer->inbuf_xlat, xlat_align)) {
++		dev_err(&perf->ntb->dev, "Unaligned inbuf allocated\n");
++		goto err_free_inbuf;
++	}
++
++	ret = ntb_mw_set_trans(perf->ntb, peer->pidx, peer->gidx,
++			       peer->inbuf_xlat, peer->inbuf_size);
++	if (ret) {
++		dev_err(&perf->ntb->dev, "Failed to set inbuf translation\n");
++		goto err_free_inbuf;
++	}
++
++	/*
++	 * We submit inbuf xlat transmission cmd for execution here to follow
++	 * the code architecture, even though this method is called from service
++	 * work itself so the command will be executed right after it returns.
++	 */
++	(void)perf_cmd_exec(peer, PERF_CMD_SXLAT);
++
++	return 0;
++
++err_free_inbuf:
++	perf_free_inbuf(peer);
++
++	return ret;
++}
++
++static void perf_service_work(struct work_struct *work)
++{
++	struct perf_peer *peer = to_peer_service(work);
++
++	if (test_and_clear_bit(PERF_CMD_SSIZE, &peer->sts))
++		perf_cmd_send(peer, PERF_CMD_SSIZE, peer->outbuf_size);
++
++	if (test_and_clear_bit(PERF_CMD_RSIZE, &peer->sts))
++		perf_setup_inbuf(peer);
++
++	if (test_and_clear_bit(PERF_CMD_SXLAT, &peer->sts))
++		perf_cmd_send(peer, PERF_CMD_SXLAT, peer->inbuf_xlat);
++
++	if (test_and_clear_bit(PERF_CMD_RXLAT, &peer->sts))
++		perf_setup_outbuf(peer);
++
++	if (test_and_clear_bit(PERF_CMD_CLEAR, &peer->sts)) {
++		init_completion(&peer->init_comp);
++		clear_bit(PERF_STS_DONE, &peer->sts);
++		if (test_bit(0, &peer->perf->busy_flag) &&
++		    peer == peer->perf->test_peer) {
++			dev_warn(&peer->perf->ntb->dev,
++				"Freeing while test on-fly\n");
++			perf_terminate_test(peer->perf);
++		}
++		perf_free_outbuf(peer);
++		perf_free_inbuf(peer);
++	}
++}
++
++static int perf_init_service(struct perf_ctx *perf)
++{
++	u64 mask;
++
++	if (ntb_peer_mw_count(perf->ntb) < perf->pcnt) {
++		dev_err(&perf->ntb->dev, "Not enough memory windows\n");
++		return -EINVAL;
++	}
++
++	if (ntb_msg_count(perf->ntb) >= PERF_MSG_CNT) {
++		perf->cmd_send = perf_msg_cmd_send;
++		perf->cmd_recv = perf_msg_cmd_recv;
++
++		dev_dbg(&perf->ntb->dev, "Message service initialized\n");
++
++		return 0;
++	}
++
++	dev_dbg(&perf->ntb->dev, "Message service unsupported\n");
++
++	mask = GENMASK_ULL(perf->pcnt, 0);
++	if (ntb_spad_count(perf->ntb) >= PERF_SPAD_CNT(perf->pcnt) &&
++	    (ntb_db_valid_mask(perf->ntb) & mask) == mask) {
++		perf->cmd_send = perf_spad_cmd_send;
++		perf->cmd_recv = perf_spad_cmd_recv;
++
++		dev_dbg(&perf->ntb->dev, "Scratchpad service initialized\n");
++
++		return 0;
++	}
++
++	dev_dbg(&perf->ntb->dev, "Scratchpad service unsupported\n");
++
++	dev_err(&perf->ntb->dev, "Command services unsupported\n");
++
++	return -EINVAL;
++}
++
++static int perf_enable_service(struct perf_ctx *perf)
++{
++	u64 mask, incmd_bit;
++	int ret, sidx, scnt;
++
++	mask = ntb_db_valid_mask(perf->ntb);
++	(void)ntb_db_set_mask(perf->ntb, mask);
++
++	ret = ntb_set_ctx(perf->ntb, perf, &perf_ops);
++	if (ret)
++		return ret;
++
++	if (perf->cmd_send == perf_msg_cmd_send) {
++		u64 inbits, outbits;
++
++		inbits = ntb_msg_inbits(perf->ntb);
++		outbits = ntb_msg_outbits(perf->ntb);
++		(void)ntb_msg_set_mask(perf->ntb, inbits | outbits);
++
++		incmd_bit = BIT_ULL(__ffs64(inbits));
++		ret = ntb_msg_clear_mask(perf->ntb, incmd_bit);
++
++		dev_dbg(&perf->ntb->dev, "MSG sts unmasked %#llx\n", incmd_bit);
++	} else {
++		scnt = ntb_spad_count(perf->ntb);
++		for (sidx = 0; sidx < scnt; sidx++)
++			ntb_spad_write(perf->ntb, sidx, PERF_CMD_INVAL);
++		incmd_bit = PERF_SPAD_NOTIFY(perf->gidx);
++		ret = ntb_db_clear_mask(perf->ntb, incmd_bit);
++
++		dev_dbg(&perf->ntb->dev, "DB bits unmasked %#llx\n", incmd_bit);
++	}
++	if (ret) {
++		ntb_clear_ctx(perf->ntb);
++		return ret;
++	}
++
++	ntb_link_enable(perf->ntb, NTB_SPEED_AUTO, NTB_WIDTH_AUTO);
++	/* Might be not necessary */
++	ntb_link_event(perf->ntb);
++
++	return 0;
++}
++
++static void perf_disable_service(struct perf_ctx *perf)
++{
++	int pidx;
++
++	if (perf->cmd_send == perf_msg_cmd_send) {
++		u64 inbits;
++
++		inbits = ntb_msg_inbits(perf->ntb);
++		(void)ntb_msg_set_mask(perf->ntb, inbits);
++	} else {
++		(void)ntb_db_set_mask(perf->ntb, PERF_SPAD_NOTIFY(perf->gidx));
++	}
++
++	ntb_clear_ctx(perf->ntb);
++
++	for (pidx = 0; pidx < perf->pcnt; pidx++)
++		perf_cmd_exec(&perf->peers[pidx], PERF_CMD_CLEAR);
++
++	for (pidx = 0; pidx < perf->pcnt; pidx++)
++		flush_work(&perf->peers[pidx].service);
++
++	for (pidx = 0; pidx < perf->pcnt; pidx++) {
++		struct perf_peer *peer = &perf->peers[pidx];
++
++		ntb_spad_write(perf->ntb, PERF_SPAD_CMD(peer->gidx), 0);
++	}
++
++	ntb_db_clear(perf->ntb, PERF_SPAD_NOTIFY(perf->gidx));
++
++	ntb_link_disable(perf->ntb);
++}
++
++/*==============================================================================
++ *                      Performance measuring work-thread
++ *==============================================================================
++ */
++
++static void perf_dma_copy_callback(void *data)
++{
++	struct perf_thread *pthr = data;
++
++	atomic_dec(&pthr->dma_sync);
++	wake_up(&pthr->dma_wait);
++}
++
++static int perf_copy_chunk(struct perf_thread *pthr,
++			   void __iomem *dst, void *src, size_t len)
++{
++	struct dma_async_tx_descriptor *tx;
++	struct dmaengine_unmap_data *unmap;
++	struct device *dma_dev;
++	int try = 0, ret = 0;
++
++	if (!use_dma) {
++		memcpy_toio(dst, src, len);
++		goto ret_check_tsync;
++	}
++
++	dma_dev = pthr->dma_chan->device->dev;
++
++	if (!is_dma_copy_aligned(pthr->dma_chan->device, offset_in_page(src),
++				 offset_in_page(dst), len))
++		return -EIO;
++
++	unmap = dmaengine_get_unmap_data(dma_dev, 2, GFP_NOWAIT);
++	if (!unmap)
++		return -ENOMEM;
++
++	unmap->len = len;
++	unmap->addr[0] = dma_map_page(dma_dev, virt_to_page(src),
++		offset_in_page(src), len, DMA_TO_DEVICE);
++	if (dma_mapping_error(dma_dev, unmap->addr[0])) {
++		ret = -EIO;
++		goto err_free_resource;
++	}
++	unmap->to_cnt = 1;
++
++	unmap->addr[1] = dma_map_page(dma_dev, virt_to_page(dst),
++		offset_in_page(dst), len, DMA_FROM_DEVICE);
++	if (dma_mapping_error(dma_dev, unmap->addr[1])) {
++		ret = -EIO;
++		goto err_free_resource;
++	}
++	unmap->from_cnt = 1;
++
++	do {
++		tx = dmaengine_prep_dma_memcpy(pthr->dma_chan, unmap->addr[1],
++			unmap->addr[0], len, DMA_PREP_INTERRUPT | DMA_CTRL_ACK);
++		if (!tx)
++			msleep(DMA_MDELAY);
++	} while (!tx && (try++ < DMA_TRIES));
++
++	if (!tx) {
++		ret = -EIO;
++		goto err_free_resource;
++	}
++
++	tx->callback = perf_dma_copy_callback;
++	tx->callback_param = pthr;
++	dma_set_unmap(tx, unmap);
++
++	ret = dma_submit_error(dmaengine_submit(tx));
++	if (ret) {
++		dmaengine_unmap_put(unmap);
++		goto err_free_resource;
++	}
++
++	dmaengine_unmap_put(unmap);
++
++	atomic_inc(&pthr->dma_sync);
++	dma_async_issue_pending(pthr->dma_chan);
++
++ret_check_tsync:
++	return likely(atomic_read(&pthr->perf->tsync) > 0) ? 0 : -EINTR;
++
++err_free_resource:
++	dmaengine_unmap_put(unmap);
++
++	return ret;
++}
++
++static bool perf_dma_filter(struct dma_chan *chan, void *data)
++{
++	struct perf_ctx *perf = data;
++	int node;
++
++	node = dev_to_node(&perf->ntb->dev);
++
++	return node == NUMA_NO_NODE || node == dev_to_node(chan->device->dev);
++}
++
++static int perf_init_test(struct perf_thread *pthr)
++{
++	struct perf_ctx *perf = pthr->perf;
++	dma_cap_mask_t dma_mask;
++
++	pthr->src = kmalloc_node(perf->test_peer->outbuf_size, GFP_KERNEL,
++				 dev_to_node(&perf->ntb->dev));
++	if (!pthr->src)
++		return -ENOMEM;
++
++	get_random_bytes(pthr->src, perf->test_peer->outbuf_size);
++
++	if (!use_dma)
++		return 0;
++
++	dma_cap_zero(dma_mask);
++	dma_cap_set(DMA_MEMCPY, dma_mask);
++	pthr->dma_chan = dma_request_channel(dma_mask, perf_dma_filter, perf);
++	if (!pthr->dma_chan) {
++		dev_err(&perf->ntb->dev, "%d: Failed to get DMA channel\n",
++			pthr->tidx);
++		atomic_dec(&perf->tsync);
++		wake_up(&perf->twait);
++		kfree(pthr->src);
++		return -ENODEV;
++	}
++
++	atomic_set(&pthr->dma_sync, 0);
++
++	return 0;
++}
++
++static int perf_run_test(struct perf_thread *pthr)
++{
++	struct perf_peer *peer = pthr->perf->test_peer;
++	struct perf_ctx *perf = pthr->perf;
++	void __iomem *flt_dst, *bnd_dst;
++	u64 total_size, chunk_size;
++	void *flt_src;
++	int ret = 0;
++
++	total_size = 1ULL << total_order;
++	chunk_size = 1ULL << chunk_order;
++	chunk_size = min_t(u64, peer->outbuf_size, chunk_size);
++
++	flt_src = pthr->src;
++	bnd_dst = peer->outbuf + peer->outbuf_size;
++	flt_dst = peer->outbuf;
++
++	pthr->duration = ktime_get();
++
++	/* Copied field is cleared on test launch stage */
++	while (pthr->copied < total_size) {
++		ret = perf_copy_chunk(pthr, flt_dst, flt_src, chunk_size);
++		if (ret) {
++			dev_err(&perf->ntb->dev, "%d: Got error %d on test\n",
++				pthr->tidx, ret);
++			return ret;
++		}
++
++		pthr->copied += chunk_size;
++
++		flt_dst += chunk_size;
++		flt_src += chunk_size;
++		if (flt_dst >= bnd_dst || flt_dst < peer->outbuf) {
++			flt_dst = peer->outbuf;
++			flt_src = pthr->src;
++		}
++
++		/* Give up CPU to give a chance for other threads to use it */
++		schedule();
++	}
++
++	return 0;
++}
++
++static int perf_sync_test(struct perf_thread *pthr)
++{
++	struct perf_ctx *perf = pthr->perf;
++
++	if (!use_dma)
++		goto no_dma_ret;
++
++	wait_event(pthr->dma_wait,
++		   (atomic_read(&pthr->dma_sync) == 0 ||
++		    atomic_read(&perf->tsync) < 0));
++
++	if (atomic_read(&perf->tsync) < 0)
++		return -EINTR;
++
++no_dma_ret:
++	pthr->duration = ktime_sub(ktime_get(), pthr->duration);
++
++	dev_dbg(&perf->ntb->dev, "%d: copied %llu bytes\n",
++		pthr->tidx, pthr->copied);
++
++	dev_dbg(&perf->ntb->dev, "%d: lasted %llu usecs\n",
++		pthr->tidx, ktime_to_us(pthr->duration));
++
++	dev_dbg(&perf->ntb->dev, "%d: %llu MBytes/s\n", pthr->tidx,
++		div64_u64(pthr->copied, ktime_to_us(pthr->duration)));
++
++	return 0;
++}
++
++static void perf_clear_test(struct perf_thread *pthr)
++{
++	struct perf_ctx *perf = pthr->perf;
++
++	if (!use_dma)
++		goto no_dma_notify;
++
++	/*
++	 * If test finished without errors, termination isn't needed.
++	 * We call it anyway just to be sure of the transfers completion.
++	 */
++	(void)dmaengine_terminate_sync(pthr->dma_chan);
++
++	dma_release_channel(pthr->dma_chan);
++
++no_dma_notify:
++	atomic_dec(&perf->tsync);
++	wake_up(&perf->twait);
++	kfree(pthr->src);
++}
++
++static void perf_thread_work(struct work_struct *work)
++{
++	struct perf_thread *pthr = to_thread_work(work);
++	int ret;
++
++	/*
++	 * Perform stages in compliance with use_dma flag value.
++	 * Test status is changed only if error happened, otherwise
++	 * status -ENODATA is kept while test is on-fly. Results
++	 * synchronization is performed only if test fininshed
++	 * without an error or interruption.
++	 */
++	ret = perf_init_test(pthr);
++	if (ret) {
++		pthr->status = ret;
++		return;
++	}
++
++	ret = perf_run_test(pthr);
++	if (ret) {
++		pthr->status = ret;
++		goto err_clear_test;
++	}
++
++	pthr->status = perf_sync_test(pthr);
++
++err_clear_test:
++	perf_clear_test(pthr);
++}
++
++static int perf_set_tcnt(struct perf_ctx *perf, u8 tcnt)
++{
++	if (tcnt == 0 || tcnt > MAX_THREADS_CNT)
++		return -EINVAL;
++
++	if (test_and_set_bit_lock(0, &perf->busy_flag))
++		return -EBUSY;
++
++	perf->tcnt = tcnt;
++
++	clear_bit_unlock(0, &perf->busy_flag);
++
++	return 0;
++}
++
++static void perf_terminate_test(struct perf_ctx *perf)
++{
++	int tidx;
++
++	atomic_set(&perf->tsync, -1);
++	wake_up(&perf->twait);
++
++	for (tidx = 0; tidx < MAX_THREADS_CNT; tidx++) {
++		wake_up(&perf->threads[tidx].dma_wait);
++		cancel_work_sync(&perf->threads[tidx].work);
++	}
++}
++
++static int perf_submit_test(struct perf_peer *peer)
++{
++	struct perf_ctx *perf = peer->perf;
++	struct perf_thread *pthr;
++	int tidx, ret;
++
++	ret = wait_for_completion_interruptible(&peer->init_comp);
++	if (ret < 0)
++		return ret;
++
++	if (test_and_set_bit_lock(0, &perf->busy_flag))
++		return -EBUSY;
++
++	perf->test_peer = peer;
++	atomic_set(&perf->tsync, perf->tcnt);
++
++	for (tidx = 0; tidx < MAX_THREADS_CNT; tidx++) {
++		pthr = &perf->threads[tidx];
++
++		pthr->status = -ENODATA;
++		pthr->copied = 0;
++		pthr->duration = ktime_set(0, 0);
++		if (tidx < perf->tcnt)
++			(void)queue_work(perf_wq, &pthr->work);
++	}
++
++	ret = wait_event_interruptible(perf->twait,
++				       atomic_read(&perf->tsync) <= 0);
++	if (ret == -ERESTARTSYS) {
++		perf_terminate_test(perf);
++		ret = -EINTR;
++	}
++
++	clear_bit_unlock(0, &perf->busy_flag);
++
++	return ret;
++}
++
++static int perf_read_stats(struct perf_ctx *perf, char *buf,
++			   size_t size, ssize_t *pos)
++{
++	struct perf_thread *pthr;
++	int tidx;
++
++	if (test_and_set_bit_lock(0, &perf->busy_flag))
++		return -EBUSY;
++
++	(*pos) += scnprintf(buf + *pos, size - *pos,
++		"    Peer %d test statistics:\n", perf->test_peer->pidx);
++
++	for (tidx = 0; tidx < MAX_THREADS_CNT; tidx++) {
++		pthr = &perf->threads[tidx];
++
++		if (pthr->status == -ENODATA)
++			continue;
++
++		if (pthr->status) {
++			(*pos) += scnprintf(buf + *pos, size - *pos,
++				"%d: error status %d\n", tidx, pthr->status);
++			continue;
++		}
++
++		(*pos) += scnprintf(buf + *pos, size - *pos,
++			"%d: copied %llu bytes in %llu usecs, %llu MBytes/s\n",
++			tidx, pthr->copied, ktime_to_us(pthr->duration),
++			div64_u64(pthr->copied, ktime_to_us(pthr->duration)));
++	}
++
++	clear_bit_unlock(0, &perf->busy_flag);
++
++	return 0;
++}
++
++static void perf_init_threads(struct perf_ctx *perf)
++{
++	struct perf_thread *pthr;
++	int tidx;
++
++	perf->tcnt = DEF_THREADS_CNT;
++	perf->test_peer = &perf->peers[0];
++	init_waitqueue_head(&perf->twait);
++
++	for (tidx = 0; tidx < MAX_THREADS_CNT; tidx++) {
++		pthr = &perf->threads[tidx];
++
++		pthr->perf = perf;
++		pthr->tidx = tidx;
++		pthr->status = -ENODATA;
++		init_waitqueue_head(&pthr->dma_wait);
++		INIT_WORK(&pthr->work, perf_thread_work);
++	}
++}
++
++static void perf_clear_threads(struct perf_ctx *perf)
++{
++	perf_terminate_test(perf);
++}
++
++/*==============================================================================
++ *                               DebugFS nodes
++ *==============================================================================
++ */
++
++static ssize_t perf_dbgfs_read_info(struct file *filep, char __user *ubuf,
++				    size_t size, loff_t *offp)
++{
++	struct perf_ctx *perf = filep->private_data;
++	struct perf_peer *peer;
++	size_t buf_size;
++	ssize_t pos = 0;
++	int ret, pidx;
++	char *buf;
++
++	buf_size = min_t(size_t, size, 0x1000U);
++
++	buf = kmalloc(buf_size, GFP_KERNEL);
++	if (!buf)
++		return -ENOMEM;
++
++	pos += scnprintf(buf + pos, buf_size - pos,
++		"    Performance measuring tool info:\n\n");
++
++	pos += scnprintf(buf + pos, buf_size - pos,
++		"Local port %d, Global index %d\n", ntb_port_number(perf->ntb),
++		perf->gidx);
++	pos += scnprintf(buf + pos, buf_size - pos, "Test status: ");
++	if (test_bit(0, &perf->busy_flag)) {
++		pos += scnprintf(buf + pos, buf_size - pos,
++			"on-fly with port %d (%d)\n",
++			ntb_peer_port_number(perf->ntb, perf->test_peer->pidx),
++			perf->test_peer->pidx);
++	} else {
++		pos += scnprintf(buf + pos, buf_size - pos, "idle\n");
++	}
++
++	for (pidx = 0; pidx < perf->pcnt; pidx++) {
++		peer = &perf->peers[pidx];
++
++		pos += scnprintf(buf + pos, buf_size - pos,
++			"Port %d (%d), Global index %d:\n",
++			ntb_peer_port_number(perf->ntb, peer->pidx), peer->pidx,
++			peer->gidx);
++
++		pos += scnprintf(buf + pos, buf_size - pos,
++			"\tLink status: %s\n",
++			test_bit(PERF_STS_LNKUP, &peer->sts) ? "up" : "down");
++
++		pos += scnprintf(buf + pos, buf_size - pos,
++			"\tOut buffer addr 0x%pK\n", peer->outbuf);
++
++		pos += scnprintf(buf + pos, buf_size - pos,
++			"\tOut buffer size %pa\n", &peer->outbuf_size);
++
++		pos += scnprintf(buf + pos, buf_size - pos,
++			"\tOut buffer xlat 0x%016llx[p]\n", peer->outbuf_xlat);
++
++		if (!peer->inbuf) {
++			pos += scnprintf(buf + pos, buf_size - pos,
++				"\tIn buffer addr: unallocated\n");
++			continue;
++		}
++
++		pos += scnprintf(buf + pos, buf_size - pos,
++			"\tIn buffer addr 0x%pK\n", peer->inbuf);
++
++		pos += scnprintf(buf + pos, buf_size - pos,
++			"\tIn buffer size %pa\n", &peer->inbuf_size);
++
++		pos += scnprintf(buf + pos, buf_size - pos,
++			"\tIn buffer xlat %pad[p]\n", &peer->inbuf_xlat);
++	}
++
++	ret = simple_read_from_buffer(ubuf, size, offp, buf, pos);
++	kfree(buf);
++
++	return ret;
++}
++
++static const struct file_operations perf_dbgfs_info = {
++	.open = simple_open,
++	.read = perf_dbgfs_read_info
++};
++
++static ssize_t perf_dbgfs_read_run(struct file *filep, char __user *ubuf,
++				   size_t size, loff_t *offp)
++{
++	struct perf_ctx *perf = filep->private_data;
++	ssize_t ret, pos = 0;
++	char *buf;
++
++	buf = kmalloc(PERF_BUF_LEN, GFP_KERNEL);
++	if (!buf)
++		return -ENOMEM;
++
++	ret = perf_read_stats(perf, buf, PERF_BUF_LEN, &pos);
++	if (ret)
++		goto err_free;
++
++	ret = simple_read_from_buffer(ubuf, size, offp, buf, pos);
++err_free:
++	kfree(buf);
++
++	return ret;
++}
++
++static ssize_t perf_dbgfs_write_run(struct file *filep, const char __user *ubuf,
++				    size_t size, loff_t *offp)
++{
++	struct perf_ctx *perf = filep->private_data;
++	struct perf_peer *peer;
++	int pidx, ret;
++
++	ret = kstrtoint_from_user(ubuf, size, 0, &pidx);
++	if (ret)
++		return ret;
++
++	if (pidx < 0 || pidx >= perf->pcnt)
++		return -EINVAL;
++
++	peer = &perf->peers[pidx];
++
++	ret = perf_submit_test(peer);
++	if (ret)
++		return ret;
++
++	return size;
++}
++
++static const struct file_operations perf_dbgfs_run = {
++	.open = simple_open,
++	.read = perf_dbgfs_read_run,
++	.write = perf_dbgfs_write_run
++};
++
++static ssize_t perf_dbgfs_read_tcnt(struct file *filep, char __user *ubuf,
++				    size_t size, loff_t *offp)
++{
++	struct perf_ctx *perf = filep->private_data;
++	char buf[8];
++	ssize_t pos;
++
++	pos = scnprintf(buf, sizeof(buf), "%hhu\n", perf->tcnt);
++
++	return simple_read_from_buffer(ubuf, size, offp, buf, pos);
++}
++
++static ssize_t perf_dbgfs_write_tcnt(struct file *filep,
++				     const char __user *ubuf,
++				     size_t size, loff_t *offp)
++{
++	struct perf_ctx *perf = filep->private_data;
++	int ret;
++	u8 val;
++
++	ret = kstrtou8_from_user(ubuf, size, 0, &val);
++	if (ret)
++		return ret;
++
++	ret = perf_set_tcnt(perf, val);
++	if (ret)
++		return ret;
++
++	return size;
++}
++
++static const struct file_operations perf_dbgfs_tcnt = {
++	.open = simple_open,
++	.read = perf_dbgfs_read_tcnt,
++	.write = perf_dbgfs_write_tcnt
++};
++
++static void perf_setup_dbgfs(struct perf_ctx *perf)
++{
++	struct pci_dev *pdev = perf->ntb->pdev;
++
++	perf->dbgfs_dir = debugfs_create_dir(pci_name(pdev), perf_dbgfs_topdir);
++	if (!perf->dbgfs_dir) {
++		dev_warn(&perf->ntb->dev, "DebugFS unsupported\n");
++		return;
++	}
++
++	debugfs_create_file("info", 0600, perf->dbgfs_dir, perf,
++			    &perf_dbgfs_info);
++
++	debugfs_create_file("run", 0600, perf->dbgfs_dir, perf,
++			    &perf_dbgfs_run);
++
++	debugfs_create_file("threads_count", 0600, perf->dbgfs_dir, perf,
++			    &perf_dbgfs_tcnt);
++
++	/* They are made read-only for test exec safety and integrity */
++	debugfs_create_u8("chunk_order", 0500, perf->dbgfs_dir, &chunk_order);
++
++	debugfs_create_u8("total_order", 0500, perf->dbgfs_dir, &total_order);
++
++	debugfs_create_bool("use_dma", 0500, perf->dbgfs_dir, &use_dma);
++}
++
++static void perf_clear_dbgfs(struct perf_ctx *perf)
++{
++	debugfs_remove_recursive(perf->dbgfs_dir);
++}
++
++/*==============================================================================
++ *                        Basic driver initialization
++ *==============================================================================
++ */
++
++static struct perf_ctx *perf_create_data(struct ntb_dev *ntb)
++{
++	struct perf_ctx *perf;
++
++	perf = devm_kzalloc(&ntb->dev, sizeof(*perf), GFP_KERNEL);
++	if (!perf)
++		return ERR_PTR(-ENOMEM);
++
++	perf->pcnt = ntb_peer_port_count(ntb);
++	perf->peers = devm_kcalloc(&ntb->dev, perf->pcnt, sizeof(*perf->peers),
++				  GFP_KERNEL);
++	if (!perf->peers)
++		return ERR_PTR(-ENOMEM);
++
++	perf->ntb = ntb;
++
++	return perf;
++}
++
++static int perf_setup_peer_mw(struct perf_peer *peer)
++{
++	struct perf_ctx *perf = peer->perf;
++	phys_addr_t phys_addr;
++	int ret;
++
++	/* Get outbound MW parameters and map it */
++	ret = ntb_peer_mw_get_addr(perf->ntb, perf->gidx, &phys_addr,
++				   &peer->outbuf_size);
++	if (ret)
++		return ret;
++
++	peer->outbuf = devm_ioremap_wc(&perf->ntb->dev, phys_addr,
++					peer->outbuf_size);
++	if (!peer->outbuf)
++		return -ENOMEM;
++
++	if (max_mw_size && peer->outbuf_size > max_mw_size) {
++		peer->outbuf_size = max_mw_size;
++		dev_warn(&peer->perf->ntb->dev,
++			"Peer %d outbuf reduced to %pa\n", peer->pidx,
++			&peer->outbuf_size);
++	}
++
++	return 0;
++}
++
++static int perf_init_peers(struct perf_ctx *perf)
++{
++	struct perf_peer *peer;
++	int pidx, lport, ret;
++
++	lport = ntb_port_number(perf->ntb);
++	perf->gidx = -1;
++	for (pidx = 0; pidx < perf->pcnt; pidx++) {
++		peer = &perf->peers[pidx];
++
++		peer->perf = perf;
++		peer->pidx = pidx;
++		if (lport < ntb_peer_port_number(perf->ntb, pidx)) {
++			if (perf->gidx == -1)
++				perf->gidx = pidx;
++			peer->gidx = pidx + 1;
++		} else {
++			peer->gidx = pidx;
++		}
++		INIT_WORK(&peer->service, perf_service_work);
++		init_completion(&peer->init_comp);
++	}
++	if (perf->gidx == -1)
++		perf->gidx = pidx;
++
++	/*
++	 * Hardware with only two ports may not have unique port
++	 * numbers. In this case, the gidxs should all be zero.
++	 */
++	if (perf->pcnt == 1 &&  ntb_port_number(perf->ntb) == 0 &&
++	    ntb_peer_port_number(perf->ntb, 0) == 0) {
++		perf->gidx = 0;
++		perf->peers[0].gidx = 0;
++	}
++
++	for (pidx = 0; pidx < perf->pcnt; pidx++) {
++		ret = perf_setup_peer_mw(&perf->peers[pidx]);
++		if (ret)
++			return ret;
++	}
++
++	dev_dbg(&perf->ntb->dev, "Global port index %d\n", perf->gidx);
++
++	return 0;
++}
++
++static int perf_probe(struct ntb_client *client, struct ntb_dev *ntb)
++{
++	struct perf_ctx *perf;
++	int ret;
++
++	perf = perf_create_data(ntb);
++	if (IS_ERR(perf))
++		return PTR_ERR(perf);
++
++	ret = perf_init_peers(perf);
++	if (ret)
++		return ret;
++
++	perf_init_threads(perf);
++
++	ret = perf_init_service(perf);
++	if (ret)
++		return ret;
++
++	ret = perf_enable_service(perf);
++	if (ret)
++		return ret;
++
++	perf_setup_dbgfs(perf);
++
++	return 0;
++}
++
++static void perf_remove(struct ntb_client *client, struct ntb_dev *ntb)
++{
++	struct perf_ctx *perf = ntb->ctx;
++
++	perf_clear_dbgfs(perf);
++
++	perf_disable_service(perf);
++
++	perf_clear_threads(perf);
++}
++
++static struct ntb_client perf_client = {
++	.ops = {
++		.probe = perf_probe,
++		.remove = perf_remove
++	}
++};
++
++static int __init perf_init(void)
++{
++	int ret;
++
++	if (chunk_order > MAX_CHUNK_ORDER) {
++		chunk_order = MAX_CHUNK_ORDER;
++		pr_info("Chunk order reduced to %hhu\n", chunk_order);
++	}
++
++	if (total_order < chunk_order) {
++		total_order = chunk_order;
++		pr_info("Total data order reduced to %hhu\n", total_order);
++	}
++
++	perf_wq = alloc_workqueue("perf_wq", WQ_UNBOUND | WQ_SYSFS, 0);
++	if (!perf_wq)
++		return -ENOMEM;
++
++	if (debugfs_initialized())
++		perf_dbgfs_topdir = debugfs_create_dir(KBUILD_MODNAME, NULL);
++
++	ret = ntb_register_client(&perf_client);
++	if (ret) {
++		debugfs_remove_recursive(perf_dbgfs_topdir);
++		destroy_workqueue(perf_wq);
++	}
++
++	return ret;
++}
++module_init(perf_init);
++
++static void __exit perf_exit(void)
++{
++	ntb_unregister_client(&perf_client);
++	debugfs_remove_recursive(perf_dbgfs_topdir);
++	destroy_workqueue(perf_wq);
++}
++module_exit(perf_exit);
+diff --git a/drivers/ntb/test/ntb_pingpong.c b/drivers/ntb/test/ntb_pingpong.c
+new file mode 100644
+index 000000000..18d00eec7
+--- /dev/null
++++ b/drivers/ntb/test/ntb_pingpong.c
+@@ -0,0 +1,436 @@
++/*
++ *   This file is provided under a dual BSD/GPLv2 license.  When using or
++ *   redistributing this file, you may do so under either license.
++ *
++ *   GPL LICENSE SUMMARY
++ *
++ *   Copyright (C) 2015 EMC Corporation. All Rights Reserved.
++ *   Copyright (C) 2017 T-Platforms. All Rights Reserved.
++ *
++ *   This program is free software; you can redistribute it and/or modify
++ *   it under the terms of version 2 of the GNU General Public License as
++ *   published by the Free Software Foundation.
++ *
++ *   This program is distributed in the hope that it will be useful, but
++ *   WITHOUT ANY WARRANTY; without even the implied warranty of
++ *   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ *   General Public License for more details.
++ *
++ *   BSD LICENSE
++ *
++ *   Copyright (C) 2015 EMC Corporation. All Rights Reserved.
++ *   Copyright (C) 2017 T-Platforms. All Rights Reserved.
++ *
++ *   Redistribution and use in source and binary forms, with or without
++ *   modification, are permitted provided that the following conditions
++ *   are met:
++ *
++ *     * Redistributions of source code must retain the above copyright
++ *       notice, this list of conditions and the following disclaimer.
++ *     * Redistributions in binary form must reproduce the above copy
++ *       notice, this list of conditions and the following disclaimer in
++ *       the documentation and/or other materials provided with the
++ *       distribution.
++ *     * Neither the name of Intel Corporation nor the names of its
++ *       contributors may be used to endorse or promote products derived
++ *       from this software without specific prior written permission.
++ *
++ *   THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS
++ *   "AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT
++ *   LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR
++ *   A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT
++ *   OWNER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL,
++ *   SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT
++ *   LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE,
++ *   DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY
++ *   THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
++ *   (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
++ *   OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
++ *
++ * PCIe NTB Pingpong Linux driver
++ */
++
++/*
++ * How to use this tool, by example.
++ *
++ * Assuming $DBG_DIR is something like:
++ * '/sys/kernel/debug/ntb_perf/0000:00:03.0'
++ * Suppose aside from local device there is at least one remote device
++ * connected to NTB with index 0.
++ *-----------------------------------------------------------------------------
++ * Eg: install driver with specified delay between doorbell event and response
++ *
++ * root@self# insmod ntb_pingpong.ko delay_ms=1000
++ *-----------------------------------------------------------------------------
++ * Eg: get number of ping-pong cycles performed
++ *
++ * root@self# cat $DBG_DIR/count
++ */
++
++#include <linux/init.h>
++#include <linux/kernel.h>
++#include <linux/module.h>
++#include <linux/device.h>
++#include <linux/bitops.h>
++
++#include <linux/pci.h>
++#include <linux/slab.h>
++#include <linux/hrtimer.h>
++#include <linux/debugfs.h>
++
++#include <linux/ntb.h>
++
++#define DRIVER_NAME		"ntb_pingpong"
++#define DRIVER_VERSION		"2.0"
++
++MODULE_LICENSE("Dual BSD/GPL");
++MODULE_VERSION(DRIVER_VERSION);
++MODULE_AUTHOR("Allen Hubbe <Allen.Hubbe@emc.com>");
++MODULE_DESCRIPTION("PCIe NTB Simple Pingpong Client");
++
++static unsigned int unsafe;
++module_param(unsafe, uint, 0644);
++MODULE_PARM_DESC(unsafe, "Run even though ntb operations may be unsafe");
++
++static unsigned int delay_ms = 1000;
++module_param(delay_ms, uint, 0644);
++MODULE_PARM_DESC(delay_ms, "Milliseconds to delay the response to peer");
++
++struct pp_ctx {
++	struct ntb_dev *ntb;
++	struct hrtimer timer;
++	u64 in_db;
++	u64 out_db;
++	int out_pidx;
++	u64 nmask;
++	u64 pmask;
++	atomic_t count;
++	spinlock_t lock;
++	struct dentry *dbgfs_dir;
++};
++#define to_pp_timer(__timer) \
++	container_of(__timer, struct pp_ctx, timer)
++
++static struct dentry *pp_dbgfs_topdir;
++
++static int pp_find_next_peer(struct pp_ctx *pp)
++{
++	u64 link, out_db;
++	int pidx;
++
++	link = ntb_link_is_up(pp->ntb, NULL, NULL);
++
++	/* Find next available peer */
++	if (link & pp->nmask)
++		pidx = __ffs64(link & pp->nmask);
++	else if (link & pp->pmask)
++		pidx = __ffs64(link & pp->pmask);
++	else
++		return -ENODEV;
++
++	out_db = BIT_ULL(ntb_peer_port_number(pp->ntb, pidx));
++
++	spin_lock(&pp->lock);
++	pp->out_pidx = pidx;
++	pp->out_db = out_db;
++	spin_unlock(&pp->lock);
++
++	return 0;
++}
++
++static void pp_setup(struct pp_ctx *pp)
++{
++	int ret;
++
++	ntb_db_set_mask(pp->ntb, pp->in_db);
++
++	hrtimer_cancel(&pp->timer);
++
++	ret = pp_find_next_peer(pp);
++	if (ret == -ENODEV) {
++		dev_dbg(&pp->ntb->dev, "Got no peers, so cancel\n");
++		return;
++	}
++
++	dev_dbg(&pp->ntb->dev, "Ping-pong started with port %d, db %#llx\n",
++		ntb_peer_port_number(pp->ntb, pp->out_pidx), pp->out_db);
++
++	hrtimer_start(&pp->timer, ms_to_ktime(delay_ms), HRTIMER_MODE_REL);
++}
++
++static void pp_clear(struct pp_ctx *pp)
++{
++	hrtimer_cancel(&pp->timer);
++
++	ntb_db_set_mask(pp->ntb, pp->in_db);
++
++	dev_dbg(&pp->ntb->dev, "Ping-pong cancelled\n");
++}
++
++static void pp_ping(struct pp_ctx *pp)
++{
++	u32 count;
++
++	count = atomic_read(&pp->count);
++
++	spin_lock(&pp->lock);
++	ntb_peer_spad_write(pp->ntb, pp->out_pidx, 0, count);
++	ntb_peer_msg_write(pp->ntb, pp->out_pidx, 0, count);
++
++	dev_dbg(&pp->ntb->dev, "Ping port %d spad %#x, msg %#x\n",
++		ntb_peer_port_number(pp->ntb, pp->out_pidx), count, count);
++
++	ntb_peer_db_set(pp->ntb, pp->out_db);
++	ntb_db_clear_mask(pp->ntb, pp->in_db);
++	spin_unlock(&pp->lock);
++}
++
++static void pp_pong(struct pp_ctx *pp)
++{
++	u32 msg_data = -1, spad_data = -1;
++	int pidx = 0;
++
++	/* Read pong data */
++	spad_data = ntb_spad_read(pp->ntb, 0);
++	msg_data = ntb_msg_read(pp->ntb, &pidx, 0);
++	ntb_msg_clear_sts(pp->ntb, -1);
++
++	/*
++	 * Scratchpad and message data may differ, since message register can't
++	 * be rewritten unless status is cleared. Additionally either of them
++	 * might be unsupported
++	 */
++	dev_dbg(&pp->ntb->dev, "Pong spad %#x, msg %#x (port %d)\n",
++		spad_data, msg_data, ntb_peer_port_number(pp->ntb, pidx));
++
++	atomic_inc(&pp->count);
++
++	ntb_db_set_mask(pp->ntb, pp->in_db);
++	ntb_db_clear(pp->ntb, pp->in_db);
++
++	hrtimer_start(&pp->timer, ms_to_ktime(delay_ms), HRTIMER_MODE_REL);
++}
++
++static enum hrtimer_restart pp_timer_func(struct hrtimer *t)
++{
++	struct pp_ctx *pp = to_pp_timer(t);
++
++	pp_ping(pp);
++
++	return HRTIMER_NORESTART;
++}
++
++static void pp_link_event(void *ctx)
++{
++	struct pp_ctx *pp = ctx;
++
++	pp_setup(pp);
++}
++
++static void pp_db_event(void *ctx, int vec)
++{
++	struct pp_ctx *pp = ctx;
++
++	pp_pong(pp);
++}
++
++static const struct ntb_ctx_ops pp_ops = {
++	.link_event = pp_link_event,
++	.db_event = pp_db_event
++};
++
++static int pp_check_ntb(struct ntb_dev *ntb)
++{
++	u64 pmask;
++
++	if (ntb_db_is_unsafe(ntb)) {
++		dev_dbg(&ntb->dev, "Doorbell is unsafe\n");
++		if (!unsafe)
++			return -EINVAL;
++	}
++
++	if (ntb_spad_is_unsafe(ntb)) {
++		dev_dbg(&ntb->dev, "Scratchpad is unsafe\n");
++		if (!unsafe)
++			return -EINVAL;
++	}
++
++	pmask = GENMASK_ULL(ntb_peer_port_count(ntb), 0);
++	if ((ntb_db_valid_mask(ntb) & pmask) != pmask) {
++		dev_err(&ntb->dev, "Unsupported DB configuration\n");
++		return -EINVAL;
++	}
++
++	if (ntb_spad_count(ntb) < 1 && ntb_msg_count(ntb) < 1) {
++		dev_err(&ntb->dev, "Scratchpads and messages unsupported\n");
++		return -EINVAL;
++	} else if (ntb_spad_count(ntb) < 1) {
++		dev_dbg(&ntb->dev, "Scratchpads unsupported\n");
++	} else if (ntb_msg_count(ntb) < 1) {
++		dev_dbg(&ntb->dev, "Messages unsupported\n");
++	}
++
++	return 0;
++}
++
++static struct pp_ctx *pp_create_data(struct ntb_dev *ntb)
++{
++	struct pp_ctx *pp;
++
++	pp = devm_kzalloc(&ntb->dev, sizeof(*pp), GFP_KERNEL);
++	if (!pp)
++		return ERR_PTR(-ENOMEM);
++
++	pp->ntb = ntb;
++	atomic_set(&pp->count, 0);
++	spin_lock_init(&pp->lock);
++	hrtimer_init(&pp->timer, CLOCK_MONOTONIC, HRTIMER_MODE_REL);
++	pp->timer.function = pp_timer_func;
++
++	return pp;
++}
++
++static void pp_init_flds(struct pp_ctx *pp)
++{
++	int pidx, lport, pcnt;
++
++	/* Find global port index */
++	lport = ntb_port_number(pp->ntb);
++	pcnt = ntb_peer_port_count(pp->ntb);
++	for (pidx = 0; pidx < pcnt; pidx++) {
++		if (lport < ntb_peer_port_number(pp->ntb, pidx))
++			break;
++	}
++
++	pp->in_db = BIT_ULL(lport);
++	pp->pmask = GENMASK_ULL(pidx, 0) >> 1;
++	pp->nmask = GENMASK_ULL(pcnt - 1, pidx);
++
++	dev_dbg(&pp->ntb->dev, "Inbound db %#llx, prev %#llx, next %#llx\n",
++		pp->in_db, pp->pmask, pp->nmask);
++}
++
++static int pp_mask_events(struct pp_ctx *pp)
++{
++	u64 db_mask, msg_mask;
++	int ret;
++
++	db_mask = ntb_db_valid_mask(pp->ntb);
++	ret = ntb_db_set_mask(pp->ntb, db_mask);
++	if (ret)
++		return ret;
++
++	/* Skip message events masking if unsupported */
++	if (ntb_msg_count(pp->ntb) < 1)
++		return 0;
++
++	msg_mask = ntb_msg_outbits(pp->ntb) | ntb_msg_inbits(pp->ntb);
++	return ntb_msg_set_mask(pp->ntb, msg_mask);
++}
++
++static int pp_setup_ctx(struct pp_ctx *pp)
++{
++	int ret;
++
++	ret = ntb_set_ctx(pp->ntb, pp, &pp_ops);
++	if (ret)
++		return ret;
++
++	ntb_link_enable(pp->ntb, NTB_SPEED_AUTO, NTB_WIDTH_AUTO);
++	/* Might be not necessary */
++	ntb_link_event(pp->ntb);
++
++	return 0;
++}
++
++static void pp_clear_ctx(struct pp_ctx *pp)
++{
++	ntb_link_disable(pp->ntb);
++
++	ntb_clear_ctx(pp->ntb);
++}
++
++static void pp_setup_dbgfs(struct pp_ctx *pp)
++{
++	struct pci_dev *pdev = pp->ntb->pdev;
++	void *ret;
++
++	pp->dbgfs_dir = debugfs_create_dir(pci_name(pdev), pp_dbgfs_topdir);
++
++	ret = debugfs_create_atomic_t("count", 0600, pp->dbgfs_dir, &pp->count);
++	if (!ret)
++		dev_warn(&pp->ntb->dev, "DebugFS unsupported\n");
++}
++
++static void pp_clear_dbgfs(struct pp_ctx *pp)
++{
++	debugfs_remove_recursive(pp->dbgfs_dir);
++}
++
++static int pp_probe(struct ntb_client *client, struct ntb_dev *ntb)
++{
++	struct pp_ctx *pp;
++	int ret;
++
++	ret = pp_check_ntb(ntb);
++	if (ret)
++		return ret;
++
++	pp = pp_create_data(ntb);
++	if (IS_ERR(pp))
++		return PTR_ERR(pp);
++
++	pp_init_flds(pp);
++
++	ret = pp_mask_events(pp);
++	if (ret)
++		return ret;
++
++	ret = pp_setup_ctx(pp);
++	if (ret)
++		return ret;
++
++	pp_setup_dbgfs(pp);
++
++	return 0;
++}
++
++static void pp_remove(struct ntb_client *client, struct ntb_dev *ntb)
++{
++	struct pp_ctx *pp = ntb->ctx;
++
++	pp_clear_dbgfs(pp);
++
++	pp_clear_ctx(pp);
++
++	pp_clear(pp);
++}
++
++static struct ntb_client pp_client = {
++	.ops = {
++		.probe = pp_probe,
++		.remove = pp_remove
++	}
++};
++
++static int __init pp_init(void)
++{
++	int ret;
++
++	if (debugfs_initialized())
++		pp_dbgfs_topdir = debugfs_create_dir(KBUILD_MODNAME, NULL);
++
++	ret = ntb_register_client(&pp_client);
++	if (ret)
++		debugfs_remove_recursive(pp_dbgfs_topdir);
++
++	return ret;
++}
++module_init(pp_init);
++
++static void __exit pp_exit(void)
++{
++	ntb_unregister_client(&pp_client);
++	debugfs_remove_recursive(pp_dbgfs_topdir);
++}
++module_exit(pp_exit);
+diff --git a/drivers/ntb/test/ntb_tool.c b/drivers/ntb/test/ntb_tool.c
+new file mode 100644
+index 000000000..311d6ab8d
+--- /dev/null
++++ b/drivers/ntb/test/ntb_tool.c
+@@ -0,0 +1,1692 @@
++/*
++ * This file is provided under a dual BSD/GPLv2 license.  When using or
++ *   redistributing this file, you may do so under either license.
++ *
++ *   GPL LICENSE SUMMARY
++ *
++ *   Copyright (C) 2015 EMC Corporation. All Rights Reserved.
++ *   Copyright (C) 2017 T-Platforms All Rights Reserved.
++ *
++ *   This program is free software; you can redistribute it and/or modify
++ *   it under the terms of version 2 of the GNU General Public License as
++ *   published by the Free Software Foundation.
++ *
++ *   This program is distributed in the hope that it will be useful, but
++ *   WITHOUT ANY WARRANTY; without even the implied warranty of
++ *   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ *   General Public License for more details.
++ *
++ *   BSD LICENSE
++ *
++ *   Copyright (C) 2015 EMC Corporation. All Rights Reserved.
++ *   Copyright (C) 2017 T-Platforms All Rights Reserved.
++ *
++ *   Redistribution and use in source and binary forms, with or without
++ *   modification, are permitted provided that the following conditions
++ *   are met:
++ *
++ *     * Redistributions of source code must retain the above copyright
++ *       notice, this list of conditions and the following disclaimer.
++ *     * Redistributions in binary form must reproduce the above copy
++ *       notice, this list of conditions and the following disclaimer in
++ *       the documentation and/or other materials provided with the
++ *       distribution.
++ *     * Neither the name of Intel Corporation nor the names of its
++ *       contributors may be used to endorse or promote products derived
++ *       from this software without specific prior written permission.
++ *
++ *   THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS
++ *   "AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT
++ *   LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR
++ *   A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT
++ *   OWNER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL,
++ *   SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT
++ *   LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE,
++ *   DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY
++ *   THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
++ *   (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
++ *   OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
++ *
++ * PCIe NTB Debugging Tool Linux driver
++ */
++
++/*
++ * How to use this tool, by example.
++ *
++ * Assuming $DBG_DIR is something like:
++ * '/sys/kernel/debug/ntb_tool/0000:00:03.0'
++ * Suppose aside from local device there is at least one remote device
++ * connected to NTB with index 0.
++ *-----------------------------------------------------------------------------
++ * Eg: check local/peer device information.
++ *
++ * # Get local device port number
++ * root@self# cat $DBG_DIR/port
++ *
++ * # Check local device functionality
++ * root@self# ls $DBG_DIR
++ * db            msg1          msg_sts     peer4/        port
++ * db_event      msg2          peer0/      peer5/        spad0
++ * db_mask       msg3          peer1/      peer_db       spad1
++ * link          msg_event     peer2/      peer_db_mask  spad2
++ * msg0          msg_mask      peer3/      peer_spad     spad3
++ * # As one can see it supports:
++ * # 1) four inbound message registers
++ * # 2) four inbound scratchpads
++ * # 3) up to six peer devices
++ *
++ * # Check peer device port number
++ * root@self# cat $DBG_DIR/peer0/port
++ *
++ * # Check peer device(s) functionality to be used
++ * root@self# ls $DBG_DIR/peer0
++ * link             mw_trans0       mw_trans6        port
++ * link_event       mw_trans1       mw_trans7        spad0
++ * msg0             mw_trans2       peer_mw_trans0   spad1
++ * msg1             mw_trans3       peer_mw_trans1   spad2
++ * msg2             mw_trans4       peer_mw_trans2   spad3
++ * msg3             mw_trans5       peer_mw_trans3
++ * # As one can see we got:
++ * # 1) four outbound message registers
++ * # 2) four outbound scratchpads
++ * # 3) eight inbound memory windows
++ * # 4) four outbound memory windows
++ *-----------------------------------------------------------------------------
++ * Eg: NTB link tests
++ *
++ * # Set local link up/down
++ * root@self# echo Y > $DBG_DIR/link
++ * root@self# echo N > $DBG_DIR/link
++ *
++ * # Check if link with peer device is up/down:
++ * root@self# cat $DBG_DIR/peer0/link
++ *
++ * # Block until the link is up/down
++ * root@self# echo Y > $DBG_DIR/peer0/link_event
++ * root@self# echo N > $DBG_DIR/peer0/link_event
++ *-----------------------------------------------------------------------------
++ * Eg: Doorbell registers tests (some functionality might be absent)
++ *
++ * # Set/clear/get local doorbell
++ * root@self# echo 's 1' > $DBG_DIR/db
++ * root@self# echo 'c 1' > $DBG_DIR/db
++ * root@self# cat  $DBG_DIR/db
++ *
++ * # Set/clear/get local doorbell mask
++ * root@self# echo 's 1' > $DBG_DIR/db_mask
++ * root@self# echo 'c 1' > $DBG_DIR/db_mask
++ * root@self# cat $DBG_DIR/db_mask
++ *
++ * # Ring/clear/get peer doorbell
++ * root@peer# echo 's 1' > $DBG_DIR/peer_db
++ * root@peer# echo 'c 1' > $DBG_DIR/peer_db
++ * root@peer# cat $DBG_DIR/peer_db
++ *
++ * # Set/clear/get peer doorbell mask
++ * root@self# echo 's 1' > $DBG_DIR/peer_db_mask
++ * root@self# echo 'c 1' > $DBG_DIR/peer_db_mask
++ * root@self# cat $DBG_DIR/peer_db_mask
++ *
++ * # Block until local doorbell is set with specified value
++ * root@self# echo 1 > $DBG_DIR/db_event
++ *-----------------------------------------------------------------------------
++ * Eg: Message registers tests (functionality might be absent)
++ *
++ * # Set/clear/get in/out message registers status
++ * root@self# echo 's 1' > $DBG_DIR/msg_sts
++ * root@self# echo 'c 1' > $DBG_DIR/msg_sts
++ * root@self# cat $DBG_DIR/msg_sts
++ *
++ * # Set/clear in/out message registers mask
++ * root@self# echo 's 1' > $DBG_DIR/msg_mask
++ * root@self# echo 'c 1' > $DBG_DIR/msg_mask
++ *
++ * # Get inbound message register #0 value and source of port index
++ * root@self# cat  $DBG_DIR/msg0
++ *
++ * # Send some data to peer over outbound message register #0
++ * root@self# echo 0x01020304 > $DBG_DIR/peer0/msg0
++ *-----------------------------------------------------------------------------
++ * Eg: Scratchpad registers tests (functionality might be absent)
++ *
++ * # Write/read to/from local scratchpad register #0
++ * root@peer# echo 0x01020304 > $DBG_DIR/spad0
++ * root@peer# cat $DBG_DIR/spad0
++ *
++ * # Write/read to/from peer scratchpad register #0
++ * root@peer# echo 0x01020304 > $DBG_DIR/peer0/spad0
++ * root@peer# cat $DBG_DIR/peer0/spad0
++ *-----------------------------------------------------------------------------
++ * Eg: Memory windows tests
++ *
++ * # Create inbound memory window buffer of specified size/get its base address
++ * root@peer# echo 16384 > $DBG_DIR/peer0/mw_trans0
++ * root@peer# cat $DBG_DIR/peer0/mw_trans0
++ *
++ * # Write/read data to/from inbound memory window
++ * root@peer# echo Hello > $DBG_DIR/peer0/mw0
++ * root@peer# head -c 7 $DBG_DIR/peer0/mw0
++ *
++ * # Map outbound memory window/check it settings (on peer device)
++ * root@peer# echo 0xADD0BA5E:16384 > $DBG_DIR/peer0/peer_mw_trans0
++ * root@peer# cat $DBG_DIR/peer0/peer_mw_trans0
++ *
++ * # Write/read data to/from outbound memory window (on peer device)
++ * root@peer# echo olleH > $DBG_DIR/peer0/peer_mw0
++ * root@peer# head -c 7 $DBG_DIR/peer0/peer_mw0
++ */
++
++#include <linux/init.h>
++#include <linux/kernel.h>
++#include <linux/module.h>
++
++#include <linux/debugfs.h>
++#include <linux/dma-mapping.h>
++#include <linux/pci.h>
++#include <linux/slab.h>
++#include <linux/uaccess.h>
++
++#include <linux/ntb.h>
++
++#define DRIVER_NAME		"ntb_tool"
++#define DRIVER_VERSION		"2.0"
++
++MODULE_LICENSE("Dual BSD/GPL");
++MODULE_VERSION(DRIVER_VERSION);
++MODULE_AUTHOR("Allen Hubbe <Allen.Hubbe@emc.com>");
++MODULE_DESCRIPTION("PCIe NTB Debugging Tool");
++
++/*
++ * Inbound and outbound memory windows descriptor. Union members selection
++ * depends on the MW type the structure describes. mm_base/dma_base are the
++ * virtual and DMA address of an inbound MW. io_base/tr_base are the MMIO
++ * mapped virtual and xlat addresses of an outbound MW respectively.
++ */
++struct tool_mw {
++	int widx;
++	int pidx;
++	struct tool_ctx *tc;
++	union {
++		u8 *mm_base;
++		u8 __iomem *io_base;
++	};
++	union {
++		dma_addr_t dma_base;
++		u64 tr_base;
++	};
++	resource_size_t size;
++	struct dentry *dbgfs_file;
++};
++
++/*
++ * Wrapper structure is used to distinguish the outbound MW peers reference
++ * within the corresponding DebugFS directory IO operation.
++ */
++struct tool_mw_wrap {
++	int pidx;
++	struct tool_mw *mw;
++};
++
++struct tool_msg {
++	int midx;
++	int pidx;
++	struct tool_ctx *tc;
++};
++
++struct tool_spad {
++	int sidx;
++	int pidx;
++	struct tool_ctx *tc;
++};
++
++struct tool_peer {
++	int pidx;
++	struct tool_ctx *tc;
++	int inmw_cnt;
++	struct tool_mw *inmws;
++	int outmw_cnt;
++	struct tool_mw_wrap *outmws;
++	int outmsg_cnt;
++	struct tool_msg *outmsgs;
++	int outspad_cnt;
++	struct tool_spad *outspads;
++	struct dentry *dbgfs_dir;
++};
++
++struct tool_ctx {
++	struct ntb_dev *ntb;
++	wait_queue_head_t link_wq;
++	wait_queue_head_t db_wq;
++	wait_queue_head_t msg_wq;
++	int outmw_cnt;
++	struct tool_mw *outmws;
++	int peer_cnt;
++	struct tool_peer *peers;
++	int inmsg_cnt;
++	struct tool_msg *inmsgs;
++	int inspad_cnt;
++	struct tool_spad *inspads;
++	struct dentry *dbgfs_dir;
++};
++
++#define TOOL_FOPS_RDWR(__name, __read, __write) \
++	const struct file_operations __name = {	\
++		.owner = THIS_MODULE,		\
++		.open = simple_open,		\
++		.read = __read,			\
++		.write = __write,		\
++	}
++
++#define TOOL_BUF_LEN 32
++
++static struct dentry *tool_dbgfs_topdir;
++
++/*==============================================================================
++ *                               NTB events handlers
++ *==============================================================================
++ */
++
++static void tool_link_event(void *ctx)
++{
++	struct tool_ctx *tc = ctx;
++	enum ntb_speed speed;
++	enum ntb_width width;
++	int up;
++
++	up = ntb_link_is_up(tc->ntb, &speed, &width);
++
++	dev_dbg(&tc->ntb->dev, "link is %s speed %d width %d\n",
++		up ? "up" : "down", speed, width);
++
++	wake_up(&tc->link_wq);
++}
++
++static void tool_db_event(void *ctx, int vec)
++{
++	struct tool_ctx *tc = ctx;
++	u64 db_bits, db_mask;
++
++	db_mask = ntb_db_vector_mask(tc->ntb, vec);
++	db_bits = ntb_db_read(tc->ntb);
++
++	dev_dbg(&tc->ntb->dev, "doorbell vec %d mask %#llx bits %#llx\n",
++		vec, db_mask, db_bits);
++
++	wake_up(&tc->db_wq);
++}
++
++static void tool_msg_event(void *ctx)
++{
++	struct tool_ctx *tc = ctx;
++	u64 msg_sts;
++
++	msg_sts = ntb_msg_read_sts(tc->ntb);
++
++	dev_dbg(&tc->ntb->dev, "message bits %#llx\n", msg_sts);
++
++	wake_up(&tc->msg_wq);
++}
++
++static const struct ntb_ctx_ops tool_ops = {
++	.link_event = tool_link_event,
++	.db_event = tool_db_event,
++	.msg_event = tool_msg_event
++};
++
++/*==============================================================================
++ *                        Common read/write methods
++ *==============================================================================
++ */
++
++static ssize_t tool_fn_read(struct tool_ctx *tc, char __user *ubuf,
++			    size_t size, loff_t *offp,
++			    u64 (*fn_read)(struct ntb_dev *))
++{
++	size_t buf_size;
++	char buf[TOOL_BUF_LEN];
++	ssize_t pos;
++
++	if (!fn_read)
++		return -EINVAL;
++
++	buf_size = min(size, sizeof(buf));
++
++	pos = scnprintf(buf, buf_size, "%#llx\n", fn_read(tc->ntb));
++
++	return simple_read_from_buffer(ubuf, size, offp, buf, pos);
++}
++
++static ssize_t tool_fn_write(struct tool_ctx *tc,
++			     const char __user *ubuf,
++			     size_t size, loff_t *offp,
++			     int (*fn_set)(struct ntb_dev *, u64),
++			     int (*fn_clear)(struct ntb_dev *, u64))
++{
++	char *buf, cmd;
++	ssize_t ret;
++	u64 bits;
++	int n;
++
++	buf = kmalloc(size + 1, GFP_KERNEL);
++	if (!buf)
++		return -ENOMEM;
++
++	ret = simple_write_to_buffer(buf, size, offp, ubuf, size);
++	if (ret < 0) {
++		kfree(buf);
++		return ret;
++	}
++
++	buf[size] = 0;
++
++	n = sscanf(buf, "%c %lli", &cmd, &bits);
++
++	kfree(buf);
++
++	if (n != 2) {
++		ret = -EINVAL;
++	} else if (cmd == 's') {
++		if (!fn_set)
++			ret = -EINVAL;
++		else
++			ret = fn_set(tc->ntb, bits);
++	} else if (cmd == 'c') {
++		if (!fn_clear)
++			ret = -EINVAL;
++		else
++			ret = fn_clear(tc->ntb, bits);
++	} else {
++		ret = -EINVAL;
++	}
++
++	return ret ? : size;
++}
++
++/*==============================================================================
++ *                            Port read/write methods
++ *==============================================================================
++ */
++
++static ssize_t tool_port_read(struct file *filep, char __user *ubuf,
++			      size_t size, loff_t *offp)
++{
++	struct tool_ctx *tc = filep->private_data;
++	char buf[TOOL_BUF_LEN];
++	int pos;
++
++	pos = scnprintf(buf, sizeof(buf), "%d\n", ntb_port_number(tc->ntb));
++
++	return simple_read_from_buffer(ubuf, size, offp, buf, pos);
++}
++
++static TOOL_FOPS_RDWR(tool_port_fops,
++		      tool_port_read,
++		      NULL);
++
++static ssize_t tool_peer_port_read(struct file *filep, char __user *ubuf,
++				   size_t size, loff_t *offp)
++{
++	struct tool_peer *peer = filep->private_data;
++	struct tool_ctx *tc = peer->tc;
++	char buf[TOOL_BUF_LEN];
++	int pos;
++
++	pos = scnprintf(buf, sizeof(buf), "%d\n",
++		ntb_peer_port_number(tc->ntb, peer->pidx));
++
++	return simple_read_from_buffer(ubuf, size, offp, buf, pos);
++}
++
++static TOOL_FOPS_RDWR(tool_peer_port_fops,
++		      tool_peer_port_read,
++		      NULL);
++
++static int tool_init_peers(struct tool_ctx *tc)
++{
++	int pidx;
++
++	tc->peer_cnt = ntb_peer_port_count(tc->ntb);
++	tc->peers = devm_kcalloc(&tc->ntb->dev, tc->peer_cnt,
++				 sizeof(*tc->peers), GFP_KERNEL);
++	if (tc->peers == NULL)
++		return -ENOMEM;
++
++	for (pidx = 0; pidx < tc->peer_cnt; pidx++) {
++		tc->peers[pidx].pidx = pidx;
++		tc->peers[pidx].tc = tc;
++	}
++
++	return 0;
++}
++
++/*==============================================================================
++ *                       Link state read/write methods
++ *==============================================================================
++ */
++
++static ssize_t tool_link_write(struct file *filep, const char __user *ubuf,
++			       size_t size, loff_t *offp)
++{
++	struct tool_ctx *tc = filep->private_data;
++	bool val;
++	int ret;
++
++	ret = kstrtobool_from_user(ubuf, size, &val);
++	if (ret)
++		return ret;
++
++	if (val)
++		ret = ntb_link_enable(tc->ntb, NTB_SPEED_AUTO, NTB_WIDTH_AUTO);
++	else
++		ret = ntb_link_disable(tc->ntb);
++
++	if (ret)
++		return ret;
++
++	return size;
++}
++
++static TOOL_FOPS_RDWR(tool_link_fops,
++		      NULL,
++		      tool_link_write);
++
++static ssize_t tool_peer_link_read(struct file *filep, char __user *ubuf,
++				   size_t size, loff_t *offp)
++{
++	struct tool_peer *peer = filep->private_data;
++	struct tool_ctx *tc = peer->tc;
++	char buf[3];
++
++	if (ntb_link_is_up(tc->ntb, NULL, NULL) & BIT(peer->pidx))
++		buf[0] = 'Y';
++	else
++		buf[0] = 'N';
++	buf[1] = '\n';
++	buf[2] = '\0';
++
++	return simple_read_from_buffer(ubuf, size, offp, buf, 2);
++}
++
++static TOOL_FOPS_RDWR(tool_peer_link_fops,
++		      tool_peer_link_read,
++		      NULL);
++
++static ssize_t tool_peer_link_event_write(struct file *filep,
++					  const char __user *ubuf,
++					  size_t size, loff_t *offp)
++{
++	struct tool_peer *peer = filep->private_data;
++	struct tool_ctx *tc = peer->tc;
++	u64 link_msk;
++	bool val;
++	int ret;
++
++	ret = kstrtobool_from_user(ubuf, size, &val);
++	if (ret)
++		return ret;
++
++	link_msk = BIT_ULL_MASK(peer->pidx);
++
++	if (wait_event_interruptible(tc->link_wq,
++		!!(ntb_link_is_up(tc->ntb, NULL, NULL) & link_msk) == val))
++		return -ERESTART;
++
++	return size;
++}
++
++static TOOL_FOPS_RDWR(tool_peer_link_event_fops,
++		      NULL,
++		      tool_peer_link_event_write);
++
++/*==============================================================================
++ *                  Memory windows read/write/setting methods
++ *==============================================================================
++ */
++
++static ssize_t tool_mw_read(struct file *filep, char __user *ubuf,
++			    size_t size, loff_t *offp)
++{
++	struct tool_mw *inmw = filep->private_data;
++
++	if (inmw->mm_base == NULL)
++		return -ENXIO;
++
++	return simple_read_from_buffer(ubuf, size, offp,
++				       inmw->mm_base, inmw->size);
++}
++
++static ssize_t tool_mw_write(struct file *filep, const char __user *ubuf,
++			     size_t size, loff_t *offp)
++{
++	struct tool_mw *inmw = filep->private_data;
++
++	if (inmw->mm_base == NULL)
++		return -ENXIO;
++
++	return simple_write_to_buffer(inmw->mm_base, inmw->size, offp,
++				      ubuf, size);
++}
++
++static TOOL_FOPS_RDWR(tool_mw_fops,
++		      tool_mw_read,
++		      tool_mw_write);
++
++static int tool_setup_mw(struct tool_ctx *tc, int pidx, int widx,
++			 size_t req_size)
++{
++	resource_size_t size, addr_align, size_align;
++	struct tool_mw *inmw = &tc->peers[pidx].inmws[widx];
++	char buf[TOOL_BUF_LEN];
++	int ret;
++
++	if (inmw->mm_base != NULL)
++		return 0;
++
++	ret = ntb_mw_get_align(tc->ntb, pidx, widx, &addr_align,
++				&size_align, &size);
++	if (ret)
++		return ret;
++
++	inmw->size = min_t(resource_size_t, req_size, size);
++	inmw->size = round_up(inmw->size, addr_align);
++	inmw->size = round_up(inmw->size, size_align);
++	inmw->mm_base = dma_alloc_coherent(&tc->ntb->pdev->dev, inmw->size,
++					   &inmw->dma_base, GFP_KERNEL);
++	if (!inmw->mm_base)
++		return -ENOMEM;
++
++	if (!IS_ALIGNED(inmw->dma_base, addr_align)) {
++		ret = -ENOMEM;
++		goto err_free_dma;
++	}
++
++	ret = ntb_mw_set_trans(tc->ntb, pidx, widx, inmw->dma_base, inmw->size);
++	if (ret)
++		goto err_free_dma;
++
++	snprintf(buf, sizeof(buf), "mw%d", widx);
++	inmw->dbgfs_file = debugfs_create_file(buf, 0600,
++					       tc->peers[pidx].dbgfs_dir, inmw,
++					       &tool_mw_fops);
++
++	return 0;
++
++err_free_dma:
++	dma_free_coherent(&tc->ntb->pdev->dev, inmw->size, inmw->mm_base,
++			  inmw->dma_base);
++	inmw->mm_base = NULL;
++	inmw->dma_base = 0;
++	inmw->size = 0;
++
++	return ret;
++}
++
++static void tool_free_mw(struct tool_ctx *tc, int pidx, int widx)
++{
++	struct tool_mw *inmw = &tc->peers[pidx].inmws[widx];
++
++	debugfs_remove(inmw->dbgfs_file);
++
++	if (inmw->mm_base != NULL) {
++		ntb_mw_clear_trans(tc->ntb, pidx, widx);
++		dma_free_coherent(&tc->ntb->pdev->dev, inmw->size,
++				  inmw->mm_base, inmw->dma_base);
++	}
++
++	inmw->mm_base = NULL;
++	inmw->dma_base = 0;
++	inmw->size = 0;
++	inmw->dbgfs_file = NULL;
++}
++
++static ssize_t tool_mw_trans_read(struct file *filep, char __user *ubuf,
++				  size_t size, loff_t *offp)
++{
++	struct tool_mw *inmw = filep->private_data;
++	resource_size_t addr_align;
++	resource_size_t size_align;
++	resource_size_t size_max;
++	ssize_t ret, off = 0;
++	size_t buf_size;
++	char *buf;
++
++	buf_size = min_t(size_t, size, 512);
++
++	buf = kmalloc(buf_size, GFP_KERNEL);
++	if (!buf)
++		return -ENOMEM;
++
++	ret = ntb_mw_get_align(inmw->tc->ntb, inmw->pidx, inmw->widx,
++			       &addr_align, &size_align, &size_max);
++	if (ret)
++		goto err;
++
++	off += scnprintf(buf + off, buf_size - off,
++			 "Inbound MW     \t%d\n",
++			 inmw->widx);
++
++	off += scnprintf(buf + off, buf_size - off,
++			 "Port           \t%d (%d)\n",
++			 ntb_peer_port_number(inmw->tc->ntb, inmw->pidx),
++			 inmw->pidx);
++
++	off += scnprintf(buf + off, buf_size - off,
++			 "Window Address \t0x%pK\n", inmw->mm_base);
++
++	off += scnprintf(buf + off, buf_size - off,
++			 "DMA Address    \t%pad\n",
++			 &inmw->dma_base);
++
++	off += scnprintf(buf + off, buf_size - off,
++			 "Window Size    \t%pa[p]\n",
++			 &inmw->size);
++
++	off += scnprintf(buf + off, buf_size - off,
++			 "Alignment      \t%pa[p]\n",
++			 &addr_align);
++
++	off += scnprintf(buf + off, buf_size - off,
++			 "Size Alignment \t%pa[p]\n",
++			 &size_align);
++
++	off += scnprintf(buf + off, buf_size - off,
++			 "Size Max       \t%pa[p]\n",
++			 &size_max);
++
++	ret = simple_read_from_buffer(ubuf, size, offp, buf, off);
++
++err:
++	kfree(buf);
++
++	return ret;
++}
++
++static ssize_t tool_mw_trans_write(struct file *filep, const char __user *ubuf,
++				   size_t size, loff_t *offp)
++{
++	struct tool_mw *inmw = filep->private_data;
++	unsigned int val;
++	int ret;
++
++	ret = kstrtouint_from_user(ubuf, size, 0, &val);
++	if (ret)
++		return ret;
++
++	tool_free_mw(inmw->tc, inmw->pidx, inmw->widx);
++	if (val) {
++		ret = tool_setup_mw(inmw->tc, inmw->pidx, inmw->widx, val);
++		if (ret)
++			return ret;
++	}
++
++	return size;
++}
++
++static TOOL_FOPS_RDWR(tool_mw_trans_fops,
++		      tool_mw_trans_read,
++		      tool_mw_trans_write);
++
++static ssize_t tool_peer_mw_read(struct file *filep, char __user *ubuf,
++				 size_t size, loff_t *offp)
++{
++	struct tool_mw *outmw = filep->private_data;
++	loff_t pos = *offp;
++	ssize_t ret;
++	void *buf;
++
++	if (outmw->io_base == NULL)
++		return -EIO;
++
++	if (pos >= outmw->size || !size)
++		return 0;
++
++	if (size > outmw->size - pos)
++		size = outmw->size - pos;
++
++	buf = kmalloc(size, GFP_KERNEL);
++	if (!buf)
++		return -ENOMEM;
++
++	memcpy_fromio(buf, outmw->io_base + pos, size);
++	ret = copy_to_user(ubuf, buf, size);
++	if (ret == size) {
++		ret = -EFAULT;
++		goto err_free;
++	}
++
++	size -= ret;
++	*offp = pos + size;
++	ret = size;
++
++err_free:
++	kfree(buf);
++
++	return ret;
++}
++
++static ssize_t tool_peer_mw_write(struct file *filep, const char __user *ubuf,
++				  size_t size, loff_t *offp)
++{
++	struct tool_mw *outmw = filep->private_data;
++	ssize_t ret;
++	loff_t pos = *offp;
++	void *buf;
++
++	if (outmw->io_base == NULL)
++		return -EIO;
++
++	if (pos >= outmw->size || !size)
++		return 0;
++	if (size > outmw->size - pos)
++		size = outmw->size - pos;
++
++	buf = kmalloc(size, GFP_KERNEL);
++	if (!buf)
++		return -ENOMEM;
++
++	ret = copy_from_user(buf, ubuf, size);
++	if (ret == size) {
++		ret = -EFAULT;
++		goto err_free;
++	}
++
++	size -= ret;
++	*offp = pos + size;
++	ret = size;
++
++	memcpy_toio(outmw->io_base + pos, buf, size);
++
++err_free:
++	kfree(buf);
++
++	return ret;
++}
++
++static TOOL_FOPS_RDWR(tool_peer_mw_fops,
++		      tool_peer_mw_read,
++		      tool_peer_mw_write);
++
++static int tool_setup_peer_mw(struct tool_ctx *tc, int pidx, int widx,
++			      u64 req_addr, size_t req_size)
++{
++	struct tool_mw *outmw = &tc->outmws[widx];
++	resource_size_t map_size;
++	phys_addr_t map_base;
++	char buf[TOOL_BUF_LEN];
++	int ret;
++
++	if (outmw->io_base != NULL)
++		return 0;
++
++	ret = ntb_peer_mw_get_addr(tc->ntb, widx, &map_base, &map_size);
++	if (ret)
++		return ret;
++
++	ret = ntb_peer_mw_set_trans(tc->ntb, pidx, widx, req_addr, req_size);
++	if (ret)
++		return ret;
++
++	outmw->io_base = ioremap_wc(map_base, map_size);
++	if (outmw->io_base == NULL) {
++		ret = -EFAULT;
++		goto err_clear_trans;
++	}
++
++	outmw->tr_base = req_addr;
++	outmw->size = req_size;
++	outmw->pidx = pidx;
++
++	snprintf(buf, sizeof(buf), "peer_mw%d", widx);
++	outmw->dbgfs_file = debugfs_create_file(buf, 0600,
++					       tc->peers[pidx].dbgfs_dir, outmw,
++					       &tool_peer_mw_fops);
++
++	return 0;
++
++err_clear_trans:
++	ntb_peer_mw_clear_trans(tc->ntb, pidx, widx);
++
++	return ret;
++}
++
++static void tool_free_peer_mw(struct tool_ctx *tc, int widx)
++{
++	struct tool_mw *outmw = &tc->outmws[widx];
++
++	debugfs_remove(outmw->dbgfs_file);
++
++	if (outmw->io_base != NULL) {
++		iounmap(tc->outmws[widx].io_base);
++		ntb_peer_mw_clear_trans(tc->ntb, outmw->pidx, widx);
++	}
++
++	outmw->io_base = NULL;
++	outmw->tr_base = 0;
++	outmw->size = 0;
++	outmw->pidx = -1;
++	outmw->dbgfs_file = NULL;
++}
++
++static ssize_t tool_peer_mw_trans_read(struct file *filep, char __user *ubuf,
++					size_t size, loff_t *offp)
++{
++	struct tool_mw_wrap *outmw_wrap = filep->private_data;
++	struct tool_mw *outmw = outmw_wrap->mw;
++	resource_size_t map_size;
++	phys_addr_t map_base;
++	ssize_t off = 0;
++	size_t buf_size;
++	char *buf;
++	int ret;
++
++	ret = ntb_peer_mw_get_addr(outmw->tc->ntb, outmw->widx,
++				  &map_base, &map_size);
++	if (ret)
++		return ret;
++
++	buf_size = min_t(size_t, size, 512);
++
++	buf = kmalloc(buf_size, GFP_KERNEL);
++	if (!buf)
++		return -ENOMEM;
++
++	off += scnprintf(buf + off, buf_size - off,
++			 "Outbound MW:        \t%d\n", outmw->widx);
++
++	if (outmw->io_base != NULL) {
++		off += scnprintf(buf + off, buf_size - off,
++			"Port attached       \t%d (%d)\n",
++			ntb_peer_port_number(outmw->tc->ntb, outmw->pidx),
++			outmw->pidx);
++	} else {
++		off += scnprintf(buf + off, buf_size - off,
++				 "Port attached       \t-1 (-1)\n");
++	}
++
++	off += scnprintf(buf + off, buf_size - off,
++			 "Virtual address     \t0x%pK\n", outmw->io_base);
++
++	off += scnprintf(buf + off, buf_size - off,
++			 "Phys Address        \t%pa[p]\n", &map_base);
++
++	off += scnprintf(buf + off, buf_size - off,
++			 "Mapping Size        \t%pa[p]\n", &map_size);
++
++	off += scnprintf(buf + off, buf_size - off,
++			 "Translation Address \t0x%016llx\n", outmw->tr_base);
++
++	off += scnprintf(buf + off, buf_size - off,
++			 "Window Size         \t%pa[p]\n", &outmw->size);
++
++	ret = simple_read_from_buffer(ubuf, size, offp, buf, off);
++	kfree(buf);
++
++	return ret;
++}
++
++static ssize_t tool_peer_mw_trans_write(struct file *filep,
++					const char __user *ubuf,
++					size_t size, loff_t *offp)
++{
++	struct tool_mw_wrap *outmw_wrap = filep->private_data;
++	struct tool_mw *outmw = outmw_wrap->mw;
++	size_t buf_size, wsize;
++	char buf[TOOL_BUF_LEN];
++	int ret, n;
++	u64 addr;
++
++	buf_size = min(size, (sizeof(buf) - 1));
++	if (copy_from_user(buf, ubuf, buf_size))
++		return -EFAULT;
++
++	buf[buf_size] = '\0';
++
++	n = sscanf(buf, "%lli:%zi", &addr, &wsize);
++	if (n != 2)
++		return -EINVAL;
++
++	tool_free_peer_mw(outmw->tc, outmw->widx);
++	if (wsize) {
++		ret = tool_setup_peer_mw(outmw->tc, outmw_wrap->pidx,
++					 outmw->widx, addr, wsize);
++		if (ret)
++			return ret;
++	}
++
++	return size;
++}
++
++static TOOL_FOPS_RDWR(tool_peer_mw_trans_fops,
++		      tool_peer_mw_trans_read,
++		      tool_peer_mw_trans_write);
++
++static int tool_init_mws(struct tool_ctx *tc)
++{
++	int widx, pidx;
++
++	/* Initialize outbound memory windows */
++	tc->outmw_cnt = ntb_peer_mw_count(tc->ntb);
++	tc->outmws = devm_kcalloc(&tc->ntb->dev, tc->outmw_cnt,
++				  sizeof(*tc->outmws), GFP_KERNEL);
++	if (tc->outmws == NULL)
++		return -ENOMEM;
++
++	for (widx = 0; widx < tc->outmw_cnt; widx++) {
++		tc->outmws[widx].widx = widx;
++		tc->outmws[widx].pidx = -1;
++		tc->outmws[widx].tc = tc;
++	}
++
++	/* Initialize inbound memory windows and outbound MWs wrapper */
++	for (pidx = 0; pidx < tc->peer_cnt; pidx++) {
++		tc->peers[pidx].inmw_cnt = ntb_mw_count(tc->ntb, pidx);
++		tc->peers[pidx].inmws =
++			devm_kcalloc(&tc->ntb->dev, tc->peers[pidx].inmw_cnt,
++				    sizeof(*tc->peers[pidx].inmws), GFP_KERNEL);
++		if (tc->peers[pidx].inmws == NULL)
++			return -ENOMEM;
++
++		for (widx = 0; widx < tc->peers[pidx].inmw_cnt; widx++) {
++			tc->peers[pidx].inmws[widx].widx = widx;
++			tc->peers[pidx].inmws[widx].pidx = pidx;
++			tc->peers[pidx].inmws[widx].tc = tc;
++		}
++
++		tc->peers[pidx].outmw_cnt = ntb_peer_mw_count(tc->ntb);
++		tc->peers[pidx].outmws =
++			devm_kcalloc(&tc->ntb->dev, tc->peers[pidx].outmw_cnt,
++				   sizeof(*tc->peers[pidx].outmws), GFP_KERNEL);
++
++		for (widx = 0; widx < tc->peers[pidx].outmw_cnt; widx++) {
++			tc->peers[pidx].outmws[widx].pidx = pidx;
++			tc->peers[pidx].outmws[widx].mw = &tc->outmws[widx];
++		}
++	}
++
++	return 0;
++}
++
++static void tool_clear_mws(struct tool_ctx *tc)
++{
++	int widx, pidx;
++
++	/* Free outbound memory windows */
++	for (widx = 0; widx < tc->outmw_cnt; widx++)
++		tool_free_peer_mw(tc, widx);
++
++	/* Free outbound memory windows */
++	for (pidx = 0; pidx < tc->peer_cnt; pidx++)
++		for (widx = 0; widx < tc->peers[pidx].inmw_cnt; widx++)
++			tool_free_mw(tc, pidx, widx);
++}
++
++/*==============================================================================
++ *                       Doorbell read/write methods
++ *==============================================================================
++ */
++
++static ssize_t tool_db_read(struct file *filep, char __user *ubuf,
++			    size_t size, loff_t *offp)
++{
++	struct tool_ctx *tc = filep->private_data;
++
++	return tool_fn_read(tc, ubuf, size, offp, tc->ntb->ops->db_read);
++}
++
++static ssize_t tool_db_write(struct file *filep, const char __user *ubuf,
++			     size_t size, loff_t *offp)
++{
++	struct tool_ctx *tc = filep->private_data;
++
++	return tool_fn_write(tc, ubuf, size, offp, tc->ntb->ops->db_set,
++			     tc->ntb->ops->db_clear);
++}
++
++static TOOL_FOPS_RDWR(tool_db_fops,
++		      tool_db_read,
++		      tool_db_write);
++
++static ssize_t tool_db_valid_mask_read(struct file *filep, char __user *ubuf,
++				       size_t size, loff_t *offp)
++{
++	struct tool_ctx *tc = filep->private_data;
++
++	return tool_fn_read(tc, ubuf, size, offp, tc->ntb->ops->db_valid_mask);
++}
++
++static TOOL_FOPS_RDWR(tool_db_valid_mask_fops,
++		      tool_db_valid_mask_read,
++		      NULL);
++
++static ssize_t tool_db_mask_read(struct file *filep, char __user *ubuf,
++				 size_t size, loff_t *offp)
++{
++	struct tool_ctx *tc = filep->private_data;
++
++	return tool_fn_read(tc, ubuf, size, offp, tc->ntb->ops->db_read_mask);
++}
++
++static ssize_t tool_db_mask_write(struct file *filep, const char __user *ubuf,
++			       size_t size, loff_t *offp)
++{
++	struct tool_ctx *tc = filep->private_data;
++
++	return tool_fn_write(tc, ubuf, size, offp, tc->ntb->ops->db_set_mask,
++			     tc->ntb->ops->db_clear_mask);
++}
++
++static TOOL_FOPS_RDWR(tool_db_mask_fops,
++		      tool_db_mask_read,
++		      tool_db_mask_write);
++
++static ssize_t tool_peer_db_read(struct file *filep, char __user *ubuf,
++				 size_t size, loff_t *offp)
++{
++	struct tool_ctx *tc = filep->private_data;
++
++	return tool_fn_read(tc, ubuf, size, offp, tc->ntb->ops->peer_db_read);
++}
++
++static ssize_t tool_peer_db_write(struct file *filep, const char __user *ubuf,
++				  size_t size, loff_t *offp)
++{
++	struct tool_ctx *tc = filep->private_data;
++
++	return tool_fn_write(tc, ubuf, size, offp, tc->ntb->ops->peer_db_set,
++			     tc->ntb->ops->peer_db_clear);
++}
++
++static TOOL_FOPS_RDWR(tool_peer_db_fops,
++		      tool_peer_db_read,
++		      tool_peer_db_write);
++
++static ssize_t tool_peer_db_mask_read(struct file *filep, char __user *ubuf,
++				   size_t size, loff_t *offp)
++{
++	struct tool_ctx *tc = filep->private_data;
++
++	return tool_fn_read(tc, ubuf, size, offp,
++			    tc->ntb->ops->peer_db_read_mask);
++}
++
++static ssize_t tool_peer_db_mask_write(struct file *filep,
++				       const char __user *ubuf,
++				       size_t size, loff_t *offp)
++{
++	struct tool_ctx *tc = filep->private_data;
++
++	return tool_fn_write(tc, ubuf, size, offp,
++			     tc->ntb->ops->peer_db_set_mask,
++			     tc->ntb->ops->peer_db_clear_mask);
++}
++
++static TOOL_FOPS_RDWR(tool_peer_db_mask_fops,
++		      tool_peer_db_mask_read,
++		      tool_peer_db_mask_write);
++
++static ssize_t tool_db_event_write(struct file *filep,
++				   const char __user *ubuf,
++				   size_t size, loff_t *offp)
++{
++	struct tool_ctx *tc = filep->private_data;
++	u64 val;
++	int ret;
++
++	ret = kstrtou64_from_user(ubuf, size, 0, &val);
++	if (ret)
++		return ret;
++
++	if (wait_event_interruptible(tc->db_wq, ntb_db_read(tc->ntb) == val))
++		return -ERESTART;
++
++	return size;
++}
++
++static TOOL_FOPS_RDWR(tool_db_event_fops,
++		      NULL,
++		      tool_db_event_write);
++
++/*==============================================================================
++ *                       Scratchpads read/write methods
++ *==============================================================================
++ */
++
++static ssize_t tool_spad_read(struct file *filep, char __user *ubuf,
++			      size_t size, loff_t *offp)
++{
++	struct tool_spad *spad = filep->private_data;
++	char buf[TOOL_BUF_LEN];
++	ssize_t pos;
++
++	if (!spad->tc->ntb->ops->spad_read)
++		return -EINVAL;
++
++	pos = scnprintf(buf, sizeof(buf), "%#x\n",
++		ntb_spad_read(spad->tc->ntb, spad->sidx));
++
++	return simple_read_from_buffer(ubuf, size, offp, buf, pos);
++}
++
++static ssize_t tool_spad_write(struct file *filep, const char __user *ubuf,
++			       size_t size, loff_t *offp)
++{
++	struct tool_spad *spad = filep->private_data;
++	u32 val;
++	int ret;
++
++	if (!spad->tc->ntb->ops->spad_write) {
++		dev_dbg(&spad->tc->ntb->dev, "no spad write fn\n");
++		return -EINVAL;
++	}
++
++	ret = kstrtou32_from_user(ubuf, size, 0, &val);
++	if (ret)
++		return ret;
++
++	ret = ntb_spad_write(spad->tc->ntb, spad->sidx, val);
++
++	return ret ?: size;
++}
++
++static TOOL_FOPS_RDWR(tool_spad_fops,
++		      tool_spad_read,
++		      tool_spad_write);
++
++static ssize_t tool_peer_spad_read(struct file *filep, char __user *ubuf,
++				   size_t size, loff_t *offp)
++{
++	struct tool_spad *spad = filep->private_data;
++	char buf[TOOL_BUF_LEN];
++	ssize_t pos;
++
++	if (!spad->tc->ntb->ops->peer_spad_read)
++		return -EINVAL;
++
++	pos = scnprintf(buf, sizeof(buf), "%#x\n",
++		ntb_peer_spad_read(spad->tc->ntb, spad->pidx, spad->sidx));
++
++	return simple_read_from_buffer(ubuf, size, offp, buf, pos);
++}
++
++static ssize_t tool_peer_spad_write(struct file *filep, const char __user *ubuf,
++				    size_t size, loff_t *offp)
++{
++	struct tool_spad *spad = filep->private_data;
++	u32 val;
++	int ret;
++
++	if (!spad->tc->ntb->ops->peer_spad_write) {
++		dev_dbg(&spad->tc->ntb->dev, "no spad write fn\n");
++		return -EINVAL;
++	}
++
++	ret = kstrtou32_from_user(ubuf, size, 0, &val);
++	if (ret)
++		return ret;
++
++	ret = ntb_peer_spad_write(spad->tc->ntb, spad->pidx, spad->sidx, val);
++
++	return ret ?: size;
++}
++
++static TOOL_FOPS_RDWR(tool_peer_spad_fops,
++		      tool_peer_spad_read,
++		      tool_peer_spad_write);
++
++static int tool_init_spads(struct tool_ctx *tc)
++{
++	int sidx, pidx;
++
++	/* Initialize inbound scratchpad structures */
++	tc->inspad_cnt = ntb_spad_count(tc->ntb);
++	tc->inspads = devm_kcalloc(&tc->ntb->dev, tc->inspad_cnt,
++				   sizeof(*tc->inspads), GFP_KERNEL);
++	if (tc->inspads == NULL)
++		return -ENOMEM;
++
++	for (sidx = 0; sidx < tc->inspad_cnt; sidx++) {
++		tc->inspads[sidx].sidx = sidx;
++		tc->inspads[sidx].pidx = -1;
++		tc->inspads[sidx].tc = tc;
++	}
++
++	/* Initialize outbound scratchpad structures */
++	for (pidx = 0; pidx < tc->peer_cnt; pidx++) {
++		tc->peers[pidx].outspad_cnt = ntb_spad_count(tc->ntb);
++		tc->peers[pidx].outspads =
++			devm_kcalloc(&tc->ntb->dev, tc->peers[pidx].outspad_cnt,
++				sizeof(*tc->peers[pidx].outspads), GFP_KERNEL);
++		if (tc->peers[pidx].outspads == NULL)
++			return -ENOMEM;
++
++		for (sidx = 0; sidx < tc->peers[pidx].outspad_cnt; sidx++) {
++			tc->peers[pidx].outspads[sidx].sidx = sidx;
++			tc->peers[pidx].outspads[sidx].pidx = pidx;
++			tc->peers[pidx].outspads[sidx].tc = tc;
++		}
++	}
++
++	return 0;
++}
++
++/*==============================================================================
++ *                       Messages read/write methods
++ *==============================================================================
++ */
++
++static ssize_t tool_inmsg_read(struct file *filep, char __user *ubuf,
++			       size_t size, loff_t *offp)
++{
++	struct tool_msg *msg = filep->private_data;
++	char buf[TOOL_BUF_LEN];
++	ssize_t pos;
++	u32 data;
++	int pidx;
++
++	data = ntb_msg_read(msg->tc->ntb, &pidx, msg->midx);
++
++	pos = scnprintf(buf, sizeof(buf), "0x%08x<-%d\n", data, pidx);
++
++	return simple_read_from_buffer(ubuf, size, offp, buf, pos);
++}
++
++static TOOL_FOPS_RDWR(tool_inmsg_fops,
++		      tool_inmsg_read,
++		      NULL);
++
++static ssize_t tool_outmsg_write(struct file *filep,
++				 const char __user *ubuf,
++				 size_t size, loff_t *offp)
++{
++	struct tool_msg *msg = filep->private_data;
++	u32 val;
++	int ret;
++
++	ret = kstrtou32_from_user(ubuf, size, 0, &val);
++	if (ret)
++		return ret;
++
++	ret = ntb_peer_msg_write(msg->tc->ntb, msg->pidx, msg->midx, val);
++
++	return ret ? : size;
++}
++
++static TOOL_FOPS_RDWR(tool_outmsg_fops,
++		      NULL,
++		      tool_outmsg_write);
++
++static ssize_t tool_msg_sts_read(struct file *filep, char __user *ubuf,
++				 size_t size, loff_t *offp)
++{
++	struct tool_ctx *tc = filep->private_data;
++
++	return tool_fn_read(tc, ubuf, size, offp, tc->ntb->ops->msg_read_sts);
++}
++
++static ssize_t tool_msg_sts_write(struct file *filep, const char __user *ubuf,
++				  size_t size, loff_t *offp)
++{
++	struct tool_ctx *tc = filep->private_data;
++
++	return tool_fn_write(tc, ubuf, size, offp, NULL,
++			     tc->ntb->ops->msg_clear_sts);
++}
++
++static TOOL_FOPS_RDWR(tool_msg_sts_fops,
++		      tool_msg_sts_read,
++		      tool_msg_sts_write);
++
++static ssize_t tool_msg_inbits_read(struct file *filep, char __user *ubuf,
++				    size_t size, loff_t *offp)
++{
++	struct tool_ctx *tc = filep->private_data;
++
++	return tool_fn_read(tc, ubuf, size, offp, tc->ntb->ops->msg_inbits);
++}
++
++static TOOL_FOPS_RDWR(tool_msg_inbits_fops,
++		      tool_msg_inbits_read,
++		      NULL);
++
++static ssize_t tool_msg_outbits_read(struct file *filep, char __user *ubuf,
++				     size_t size, loff_t *offp)
++{
++	struct tool_ctx *tc = filep->private_data;
++
++	return tool_fn_read(tc, ubuf, size, offp, tc->ntb->ops->msg_outbits);
++}
++
++static TOOL_FOPS_RDWR(tool_msg_outbits_fops,
++		      tool_msg_outbits_read,
++		      NULL);
++
++static ssize_t tool_msg_mask_write(struct file *filep, const char __user *ubuf,
++				   size_t size, loff_t *offp)
++{
++	struct tool_ctx *tc = filep->private_data;
++
++	return tool_fn_write(tc, ubuf, size, offp,
++			     tc->ntb->ops->msg_set_mask,
++			     tc->ntb->ops->msg_clear_mask);
++}
++
++static TOOL_FOPS_RDWR(tool_msg_mask_fops,
++		      NULL,
++		      tool_msg_mask_write);
++
++static ssize_t tool_msg_event_write(struct file *filep,
++				    const char __user *ubuf,
++				    size_t size, loff_t *offp)
++{
++	struct tool_ctx *tc = filep->private_data;
++	u64 val;
++	int ret;
++
++	ret = kstrtou64_from_user(ubuf, size, 0, &val);
++	if (ret)
++		return ret;
++
++	if (wait_event_interruptible(tc->msg_wq,
++		ntb_msg_read_sts(tc->ntb) == val))
++		return -ERESTART;
++
++	return size;
++}
++
++static TOOL_FOPS_RDWR(tool_msg_event_fops,
++		      NULL,
++		      tool_msg_event_write);
++
++static int tool_init_msgs(struct tool_ctx *tc)
++{
++	int midx, pidx;
++
++	/* Initialize inbound message structures */
++	tc->inmsg_cnt = ntb_msg_count(tc->ntb);
++	tc->inmsgs = devm_kcalloc(&tc->ntb->dev, tc->inmsg_cnt,
++				   sizeof(*tc->inmsgs), GFP_KERNEL);
++	if (tc->inmsgs == NULL)
++		return -ENOMEM;
++
++	for (midx = 0; midx < tc->inmsg_cnt; midx++) {
++		tc->inmsgs[midx].midx = midx;
++		tc->inmsgs[midx].pidx = -1;
++		tc->inmsgs[midx].tc = tc;
++	}
++
++	/* Initialize outbound message structures */
++	for (pidx = 0; pidx < tc->peer_cnt; pidx++) {
++		tc->peers[pidx].outmsg_cnt = ntb_msg_count(tc->ntb);
++		tc->peers[pidx].outmsgs =
++			devm_kcalloc(&tc->ntb->dev, tc->peers[pidx].outmsg_cnt,
++				sizeof(*tc->peers[pidx].outmsgs), GFP_KERNEL);
++		if (tc->peers[pidx].outmsgs == NULL)
++			return -ENOMEM;
++
++		for (midx = 0; midx < tc->peers[pidx].outmsg_cnt; midx++) {
++			tc->peers[pidx].outmsgs[midx].midx = midx;
++			tc->peers[pidx].outmsgs[midx].pidx = pidx;
++			tc->peers[pidx].outmsgs[midx].tc = tc;
++		}
++	}
++
++	return 0;
++}
++
++/*==============================================================================
++ *                          Initialization methods
++ *==============================================================================
++ */
++
++static struct tool_ctx *tool_create_data(struct ntb_dev *ntb)
++{
++	struct tool_ctx *tc;
++
++	tc = devm_kzalloc(&ntb->dev, sizeof(*tc), GFP_KERNEL);
++	if (tc == NULL)
++		return ERR_PTR(-ENOMEM);
++
++	tc->ntb = ntb;
++	init_waitqueue_head(&tc->link_wq);
++	init_waitqueue_head(&tc->db_wq);
++	init_waitqueue_head(&tc->msg_wq);
++
++	if (ntb_db_is_unsafe(ntb))
++		dev_dbg(&ntb->dev, "doorbell is unsafe\n");
++
++	if (ntb_spad_is_unsafe(ntb))
++		dev_dbg(&ntb->dev, "scratchpad is unsafe\n");
++
++	return tc;
++}
++
++static void tool_clear_data(struct tool_ctx *tc)
++{
++	wake_up(&tc->link_wq);
++	wake_up(&tc->db_wq);
++	wake_up(&tc->msg_wq);
++}
++
++static int tool_init_ntb(struct tool_ctx *tc)
++{
++	return ntb_set_ctx(tc->ntb, tc, &tool_ops);
++}
++
++static void tool_clear_ntb(struct tool_ctx *tc)
++{
++	ntb_clear_ctx(tc->ntb);
++	ntb_link_disable(tc->ntb);
++}
++
++static void tool_setup_dbgfs(struct tool_ctx *tc)
++{
++	int pidx, widx, sidx, midx;
++	char buf[TOOL_BUF_LEN];
++
++	/* This modules is useless without dbgfs... */
++	if (!tool_dbgfs_topdir) {
++		tc->dbgfs_dir = NULL;
++		return;
++	}
++
++	tc->dbgfs_dir = debugfs_create_dir(dev_name(&tc->ntb->dev),
++					   tool_dbgfs_topdir);
++	if (!tc->dbgfs_dir)
++		return;
++
++	debugfs_create_file("port", 0600, tc->dbgfs_dir,
++			    tc, &tool_port_fops);
++
++	debugfs_create_file("link", 0600, tc->dbgfs_dir,
++			    tc, &tool_link_fops);
++
++	debugfs_create_file("db", 0600, tc->dbgfs_dir,
++			    tc, &tool_db_fops);
++
++	debugfs_create_file("db_valid_mask", 0600, tc->dbgfs_dir,
++			    tc, &tool_db_valid_mask_fops);
++
++	debugfs_create_file("db_mask", 0600, tc->dbgfs_dir,
++			    tc, &tool_db_mask_fops);
++
++	debugfs_create_file("db_event", 0600, tc->dbgfs_dir,
++			    tc, &tool_db_event_fops);
++
++	debugfs_create_file("peer_db", 0600, tc->dbgfs_dir,
++			    tc, &tool_peer_db_fops);
++
++	debugfs_create_file("peer_db_mask", 0600, tc->dbgfs_dir,
++			    tc, &tool_peer_db_mask_fops);
++
++	if (tc->inspad_cnt != 0) {
++		for (sidx = 0; sidx < tc->inspad_cnt; sidx++) {
++			snprintf(buf, sizeof(buf), "spad%d", sidx);
++
++			debugfs_create_file(buf, 0600, tc->dbgfs_dir,
++					   &tc->inspads[sidx], &tool_spad_fops);
++		}
++	}
++
++	if (tc->inmsg_cnt != 0) {
++		for (midx = 0; midx < tc->inmsg_cnt; midx++) {
++			snprintf(buf, sizeof(buf), "msg%d", midx);
++			debugfs_create_file(buf, 0600, tc->dbgfs_dir,
++					   &tc->inmsgs[midx], &tool_inmsg_fops);
++		}
++
++		debugfs_create_file("msg_sts", 0600, tc->dbgfs_dir,
++				    tc, &tool_msg_sts_fops);
++
++		debugfs_create_file("msg_inbits", 0600, tc->dbgfs_dir,
++				    tc, &tool_msg_inbits_fops);
++
++		debugfs_create_file("msg_outbits", 0600, tc->dbgfs_dir,
++				    tc, &tool_msg_outbits_fops);
++
++		debugfs_create_file("msg_mask", 0600, tc->dbgfs_dir,
++				    tc, &tool_msg_mask_fops);
++
++		debugfs_create_file("msg_event", 0600, tc->dbgfs_dir,
++				    tc, &tool_msg_event_fops);
++	}
++
++	for (pidx = 0; pidx < tc->peer_cnt; pidx++) {
++		snprintf(buf, sizeof(buf), "peer%d", pidx);
++		tc->peers[pidx].dbgfs_dir =
++			debugfs_create_dir(buf, tc->dbgfs_dir);
++
++		debugfs_create_file("port", 0600,
++				    tc->peers[pidx].dbgfs_dir,
++				    &tc->peers[pidx], &tool_peer_port_fops);
++
++		debugfs_create_file("link", 0200,
++				    tc->peers[pidx].dbgfs_dir,
++				    &tc->peers[pidx], &tool_peer_link_fops);
++
++		debugfs_create_file("link_event", 0200,
++				  tc->peers[pidx].dbgfs_dir,
++				  &tc->peers[pidx], &tool_peer_link_event_fops);
++
++		for (widx = 0; widx < tc->peers[pidx].inmw_cnt; widx++) {
++			snprintf(buf, sizeof(buf), "mw_trans%d", widx);
++			debugfs_create_file(buf, 0600,
++					    tc->peers[pidx].dbgfs_dir,
++					    &tc->peers[pidx].inmws[widx],
++					    &tool_mw_trans_fops);
++		}
++
++		for (widx = 0; widx < tc->peers[pidx].outmw_cnt; widx++) {
++			snprintf(buf, sizeof(buf), "peer_mw_trans%d", widx);
++			debugfs_create_file(buf, 0600,
++					    tc->peers[pidx].dbgfs_dir,
++					    &tc->peers[pidx].outmws[widx],
++					    &tool_peer_mw_trans_fops);
++		}
++
++		for (sidx = 0; sidx < tc->peers[pidx].outspad_cnt; sidx++) {
++			snprintf(buf, sizeof(buf), "spad%d", sidx);
++
++			debugfs_create_file(buf, 0600,
++					    tc->peers[pidx].dbgfs_dir,
++					    &tc->peers[pidx].outspads[sidx],
++					    &tool_peer_spad_fops);
++		}
++
++		for (midx = 0; midx < tc->peers[pidx].outmsg_cnt; midx++) {
++			snprintf(buf, sizeof(buf), "msg%d", midx);
++			debugfs_create_file(buf, 0600,
++					    tc->peers[pidx].dbgfs_dir,
++					    &tc->peers[pidx].outmsgs[midx],
++					    &tool_outmsg_fops);
++		}
++	}
++}
++
++static void tool_clear_dbgfs(struct tool_ctx *tc)
++{
++	debugfs_remove_recursive(tc->dbgfs_dir);
++}
++
++static int tool_probe(struct ntb_client *self, struct ntb_dev *ntb)
++{
++	struct tool_ctx *tc;
++	int ret;
++
++	tc = tool_create_data(ntb);
++	if (IS_ERR(tc))
++		return PTR_ERR(tc);
++
++	ret = tool_init_peers(tc);
++	if (ret != 0)
++		goto err_clear_data;
++
++	ret = tool_init_mws(tc);
++	if (ret != 0)
++		goto err_clear_data;
++
++	ret = tool_init_spads(tc);
++	if (ret != 0)
++		goto err_clear_mws;
++
++	ret = tool_init_msgs(tc);
++	if (ret != 0)
++		goto err_clear_mws;
++
++	ret = tool_init_ntb(tc);
++	if (ret != 0)
++		goto err_clear_mws;
++
++	tool_setup_dbgfs(tc);
++
++	return 0;
++
++err_clear_mws:
++	tool_clear_mws(tc);
++
++err_clear_data:
++	tool_clear_data(tc);
++
++	return ret;
++}
++
++static void tool_remove(struct ntb_client *self, struct ntb_dev *ntb)
++{
++	struct tool_ctx *tc = ntb->ctx;
++
++	tool_clear_dbgfs(tc);
++
++	tool_clear_ntb(tc);
++
++	tool_clear_mws(tc);
++
++	tool_clear_data(tc);
++}
++
++static struct ntb_client tool_client = {
++	.ops = {
++		.probe = tool_probe,
++		.remove = tool_remove,
++	}
++};
++
++static int __init tool_init(void)
++{
++	int ret;
++
++	if (debugfs_initialized())
++		tool_dbgfs_topdir = debugfs_create_dir(KBUILD_MODNAME, NULL);
++
++	ret = ntb_register_client(&tool_client);
++	if (ret)
++		debugfs_remove_recursive(tool_dbgfs_topdir);
++
++	return ret;
++}
++module_init(tool_init);
++
++static void __exit tool_exit(void)
++{
++	ntb_unregister_client(&tool_client);
++	debugfs_remove_recursive(tool_dbgfs_topdir);
++}
++module_exit(tool_exit);
+-- 
+2.34.1
+

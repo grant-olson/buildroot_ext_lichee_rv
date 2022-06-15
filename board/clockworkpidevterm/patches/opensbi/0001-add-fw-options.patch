@@ -1,0 +1,14 @@
+diff --git a/Makefile b/Makefile
+index 062883e..7780059 100644
+--- a/Makefile
++++ b/Makefile
+@@ -12,6 +12,9 @@
+ # o  Do not print "Entering directory ...";
+ MAKEFLAGS += -r --no-print-directory
+ 
++FW_PIC=y
++FW_OPTIONS=0x2
++
+ # Readlink -f requires GNU readlink
+ ifeq ($(shell uname -s),Darwin)
+ READLINK ?= greadlink
