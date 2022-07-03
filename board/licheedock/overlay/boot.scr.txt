@@ -1,5 +1,0 @@
-setenv bootargs earlycon console=ttyS0,115200n8 console=tty0 cma=96M root=/dev/mmcblk0p1 ro rootwait video=HDMI-A-1:D fbcon=map:0
-echo "Loading kernel from mmc 0:1 to address ${kernel_addr_r}"
-load mmc 0:1 ${kernel_addr_r} boot/Image
-echo "Booting kernel with bootargs as $bootargs; and fdtcontroladdr is $fdtcontroladdr"
-booti ${kernel_addr_r} - ${fdtcontroladdr}
