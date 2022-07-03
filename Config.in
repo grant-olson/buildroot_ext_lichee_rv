@@ -1,1 +1,0 @@
-source "$BR2_EXTERNAL_LICHEERV_PATH/package/rtl8723ds/Config.in"
