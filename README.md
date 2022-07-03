@@ -1,10 +1,43 @@
-# Buildroot Externals for Lichee RV Dock
+# Buildroot Externals for Allwinner D1 boards
 
-This adds support for the RISC-V based Lichee RV products to buildroot
-to allow you to easily build new systems. Buildroot has support for
-the main Nezha board, but it does not have built in support for the
-additional hardware on these boards. This package attempts to add
-support for all hardware.
+This adds support for the RISC-V boards based on the Allwinner D1 SoC.
+
+Buildroot has support for the main Nezha board, but it does not have
+built in support for the additional hardware on these boards. This
+package attempts to add support for all hardware.
+
+## Board Status
+
+* Lichee RV Dock - `licheedock_defconfig`
+    * Well supported.
+    * Serial Console access.
+* Lichee 86 Panel - `lichee86panel_defconfig`
+    * Networking and LCD screen don't work.
+    * Access shell via USB-UART interface.
+* Clockwork Pi DevTerm - `clockworkpi_defconfig`
+    * Can be used with HDMI monitor and/or external USB keyboard.
+    * Networking and LCD screen don't work.
+    * Hidden UART interface shows logs but is non-interactive.
+* Dongshan Pi - `dongshanpi_defconfig`
+    * External monitor fires up.
+    * Still no USB so no keyboard.
+    * DEBUG interface provides console. NOTE: this is on /dev/ttyACM0 instead of /dev/ttyUSB0
+
+## Kernel Notes
+
+We're running 5.18 rc 4 on the main branch.
+
+There is a branch allwinner_5.4 which compiles some of the interfaces
+with the version of kernel that these products use. If it provides better hardware
+support in the long run it will be moved back to mainline.
+
+So far using the 5.4 kernel hasn't made it easier to find devices.
+
+The 5.18 version uses `boot.scr` to configure the kernel so it can get
+the live DTC created by U-Boot. I beleive this is done so that we can get
+dynamic things like memory size.
+
+The 5.4 version uses `extlinux/extlinux.conf`
 
 ## Building an image
 
@@ -17,53 +50,21 @@ support for all hardware.
     ````
 
 2. Patch buildroot until I get the updates to the bootloader accepted upstream
-    or figure out how to patch it via the extensions:
+    or figure out how to patch it via the extensions. Assuming you're using the
+    directory structure above:
 
     ```
-    grant@NUC:~/src$ cd buildroot
-    grant@NUC:~/src/buildroot$ patch -d . -p1 < ../buildroot_ext_lichee_rv/0001-fix-sun20i-d1-spl-in-buildroot.patch 
-    patching file boot/sun20i-d1-spl/sun20i-d1-spl.hash
-    patching file boot/sun20i-d1-spl/sun20i-d1-spl.mk
-    grant@NUC:~/src/buildroot$ git diff
-    diff --git a/boot/sun20i-d1-spl/sun20i-d1-spl.hash b/boot/sun20i-d1-spl/sun20i-d1-spl.hash
-    deleted file mode 100644
-    index 6ca60e5278..0000000000
-    --- a/boot/sun20i-d1-spl/sun20i-d1-spl.hash
-    +++ /dev/null
-    @@ -1,2 +0,0 @@
-    -# Locally computed
-    -sha256  69063601239a7254fb72e486b138d88a6f2b5c645b24cdfe9792123f975d4a8f  sun20i-d1-spl-771192d0b3737798d7feca87263c8fa74a449787.tar.gz
-    diff --git a/boot/sun20i-d1-spl/sun20i-d1-spl.mk b/boot/sun20i-d1-spl/sun20i-d1-spl.mk
-    index 2462ce2322..1f1cd99b2d 100644
-    --- a/boot/sun20i-d1-spl/sun20i-d1-spl.mk
-    +++ b/boot/sun20i-d1-spl/sun20i-d1-spl.mk
-    @@ -5,7 +5,7 @@
-     ################################################################################
-     
-     # Commit on the 'mainline' branch
-    -SUN20I_D1_SPL_VERSION = 771192d0b3737798d7feca87263c8fa74a449787
-    +SUN20I_D1_SPL_VERSION = 525883d3721f4c4d78b498e780b44e85d0676abf
-     SUN20I_D1_SPL_SITE = $(call github,smaeul,sun20i_d1_spl,$(SUN20I_D1_SPL_VERSION))
-     SUN20I_D1_SPL_INSTALL_TARGET = NO
-     SUN20I_D1_SPL_INSTALL_IMAGES = YES
-    grant@NUC:~/src/buildroot$ 
-
+    patch -d . -p1 < ../buildroot_ext_lichee_rv/0001-fix-sun20i-d1-spl-in-buildroot.patch 
     ```
     
 3. Enter the **buildroot** directory, enable the external package, and
-    grab a lichee rv configuration.
-
-    For RV DOCK:
+    grab a configuration.
 
     ```
-    grant@NUC:~/src/buildroot2$ make BR2_EXTERNAL=~/src/buildroot_ext_lichee_rv licheedock_defconfig
+    make BR2_EXTERNAL=~/src/buildroot_ext_lichee_rv licheedock_defconfig
     ```
 
-    For RV PANEL:
-
-    ```
-    grant@NUC:~/src/buildroot2$ make BR2_EXTERNAL=~/src/buildroot_ext_lichee_rv lichee86panel_defconfig
-    ```
+    See the config names for each board listed above.
 
 4. You will probably want to do some minimal configuration. For
     example adding **dropbear** for ssh access and **nano** so you don't
@@ -81,10 +82,12 @@ support for all hardware.
 
 1. If you want to remove the external package run `make BR2_EXTERNAL= menuconfig`
 
-## Connecting with Serial Console
+## Lichee Dock Serial Console
 
-You will want to have access to a serial console for initial
-configuration. Get a cheap UART adapter that support 3.3 Volt logic levels. I usually buy one that has a jumper to switch between 5 and 3.3 Volts.
+If you're developing you'll want this in case you lose screen or
+keyboard. Get a cheap UART adapter that support 3.3 Volt logic
+levels. I usually buy one that has a jumper to switch between 5 and
+3.3 Volts.
 
 ```
     <USB A CONNECTOR>
