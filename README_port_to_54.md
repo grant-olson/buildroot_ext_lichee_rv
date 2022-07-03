@@ -18,6 +18,12 @@ CONFIG_VECTOR=n
 
 ## XXX_defconfig Fixes
 
+Set version for linux headers to 5.4 replacing this setting:
+
+```
+BR2_PACKAGE_HOST_LINUX_HEADERS_CUSTOM_5_4=y
+```
+
 Replace Linux Kernel settings with to point to cuu's version
 of allwinner 5.4:
 
