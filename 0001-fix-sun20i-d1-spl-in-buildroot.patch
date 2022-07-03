@@ -1,11 +1,11 @@
 diff --git a/boot/sun20i-d1-spl/sun20i-d1-spl.hash b/boot/sun20i-d1-spl/sun20i-d1-spl.hash
-deleted file mode 100644
-index 6ca60e5278..0000000000
+index 6ca60e5278..2ba8704ed7 100644
 --- a/boot/sun20i-d1-spl/sun20i-d1-spl.hash
-+++ /dev/null
-@@ -1,2 +0,0 @@
--# Locally computed
++++ b/boot/sun20i-d1-spl/sun20i-d1-spl.hash
+@@ -1,2 +1,2 @@
+ # Locally computed
 -sha256  69063601239a7254fb72e486b138d88a6f2b5c645b24cdfe9792123f975d4a8f  sun20i-d1-spl-771192d0b3737798d7feca87263c8fa74a449787.tar.gz
++sha256	  10aa6b0dfde417f5480eee7170cee9c19ed89d752155f89495a5ad03fa4778ed  sun20i-d1-spl-525883d3721f4c4d78b498e780b44e85d0676abf.tar.gz
 diff --git a/boot/sun20i-d1-spl/sun20i-d1-spl.mk b/boot/sun20i-d1-spl/sun20i-d1-spl.mk
 index 2462ce2322..1f1cd99b2d 100644
 --- a/boot/sun20i-d1-spl/sun20i-d1-spl.mk
