@@ -49,9 +49,9 @@ The 5.4 version uses `extlinux/extlinux.conf`
       |- buildroot_ext_lichee_rv
     ````
 
-2. Patch buildroot until I get the updates to the bootloader accepted upstream
-    or figure out how to patch it via the extensions. Assuming you're using the
-    directory structure above:
+2. If you are running the latest LTS (2022.02) you must patch buildroot to
+    get the correct bootloader. This is not required for 2022.05+. Assuming
+    you're using the directory structure above:
 
     ```
     patch -d . -p1 < ../buildroot_ext_lichee_rv/0001-fix-sun20i-d1-spl-in-buildroot.patch 
